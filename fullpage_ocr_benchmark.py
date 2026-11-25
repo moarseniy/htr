@@ -646,6 +646,109 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
     }
 
 
+RUN_CONFIG_DEFAULTS = {
+    "backend": "chandra-vllm",
+    "manifest": None,
+    "split": "dev",
+    "model": None,
+    "chandra_prompt_type": "ocr_layout",
+    "batch_size": 8,
+    "max_failure_retries": 2,
+    "chandra_repeat_retries": 1,
+    "repetition_penalty": 1.05,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "disable_repetition_detection": False,
+    "repetition_min_pattern_size": 1,
+    "repetition_max_pattern_size": 5,
+    "repetition_min_count": 8,
+    "base_url": "http://localhost:8000/v1",
+    "api_key": "EMPTY",
+    "output": None,
+    "limit": None,
+    "max_tokens": None,
+    "timeout": 600,
+    "allow_thinking": False,
+    "check_images": False,
+    "fsync": False,
+}
+
+
+def apply_run_config(args, parser):
+    """Merge JSON config, explicit CLI overrides, and defaults for `run`."""
+    config_path = Path(args.config).expanduser().resolve() if args.config else None
+    values = RUN_CONFIG_DEFAULTS.copy()
+    if config_path:
+        try:
+            config_values = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"Cannot read run config {config_path}: {exc}")
+        if not isinstance(config_values, dict):
+            parser.error("Run config must be a JSON object")
+        unknown = sorted(set(config_values) - set(RUN_CONFIG_DEFAULTS))
+        if unknown:
+            parser.error(f"Unknown run config key(s): {', '.join(unknown)}")
+        values.update(config_values)
+
+    # Explicit CLI options override config values; omitted options preserve config.
+    for key in RUN_CONFIG_DEFAULTS:
+        cli_value = getattr(args, key, None)
+        if cli_value is not None:
+            values[key] = cli_value
+
+    if not values["manifest"]:
+        parser.error("Set manifest in the JSON config or pass --manifest")
+    if not values["output"]:
+        parser.error("Set output in the JSON config or pass --output")
+
+    relative_to = config_path.parent if config_path else Path.cwd()
+    for key in ("manifest", "output"):
+        expanded = os.path.expanduser(os.path.expandvars(str(values[key])))
+        if "$" in expanded:
+            parser.error(f"Unexpanded environment variable in {key}: {values[key]}")
+        path = Path(expanded)
+        if not path.is_absolute():
+            path = relative_to / path
+        values[key] = str(path.resolve())
+
+    if values["max_tokens"] is None:
+        values["max_tokens"] = 4096 if values["backend"] == "chandra-vllm" else 12288
+    if values["model"] is None:
+        values["model"] = "chandra" if values["backend"] == "chandra-vllm" else "Qwen/Qwen3.5-27B"
+
+    valid_backends = {"openai", "chandra-vllm"}
+    if values["backend"] not in valid_backends:
+        parser.error(f"backend must be one of: {', '.join(sorted(valid_backends))}")
+    if values["split"] not in {"dev", "test", "all"}:
+        parser.error("split must be dev, test or all")
+    for key in ("max_tokens", "batch_size", "repetition_min_count", "repetition_min_pattern_size",
+                "repetition_max_pattern_size"):
+        if not isinstance(values[key], int) or isinstance(values[key], bool):
+            parser.error(f"{key} must be an integer")
+    for key in ("max_failure_retries", "chandra_repeat_retries"):
+        if not isinstance(values[key], int) or isinstance(values[key], bool) or values[key] < 0:
+            parser.error(f"{key} must be a non-negative integer")
+    if values["limit"] is not None and (
+            not isinstance(values["limit"], int) or isinstance(values["limit"], bool) or values["limit"] < 1):
+        parser.error("limit must be a positive integer")
+    if values["max_tokens"] < 1 or values["batch_size"] < 1:
+        parser.error("max_tokens and batch_size must be positive")
+    if values["repetition_min_count"] < 2 or values["repetition_min_pattern_size"] < 1:
+        parser.error("repetition_min_count must be at least 2 and repetition_min_pattern_size at least 1")
+    if values["repetition_max_pattern_size"] < values["repetition_min_pattern_size"]:
+        parser.error("repetition_max_pattern_size must be >= repetition_min_pattern_size")
+    if not isinstance(values["repetition_penalty"], (int, float)) or values["repetition_penalty"] <= 0:
+        parser.error("repetition_penalty must be a positive number")
+    if not isinstance(values["frequency_penalty"], (int, float)) or not isinstance(values["presence_penalty"], (int, float)):
+        parser.error("frequency_penalty and presence_penalty must be numbers")
+    for key in ("disable_repetition_detection", "allow_thinking", "check_images", "fsync"):
+        if not isinstance(values[key], bool):
+            parser.error(f"{key} must be true or false")
+    if config_path:
+        values["config_file"] = str(config_path)
+    args.__dict__.update(values)
+
+
 def run(args):
     manifest = Path(args.manifest).expanduser().resolve()
     data = read_jsonl(manifest)
@@ -902,40 +1005,42 @@ def parser_factory():
     p.set_defaults(fn=prepare)
 
     p = sub.add_parser("run", help="Run a vLLM backend in resumable batches")
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--split", choices=["dev", "test", "all"], default="dev")
-    p.add_argument("--backend", choices=["openai", "chandra-vllm"], required=True,
+    p.add_argument("--config", help="JSON run config; explicit CLI options can override its values")
+    p.add_argument("--manifest")
+    p.add_argument("--split", choices=["dev", "test", "all"])
+    p.add_argument("--backend", choices=["openai", "chandra-vllm"],
                    help="OpenAI-compatible vLLM for Qwen, or Chandra's vLLM client")
     p.add_argument("--model", help="vLLM model name (defaults: Qwen/Qwen3.5-27B or chandra)")
-    p.add_argument("--chandra-prompt-type", choices=["ocr_layout", "ocr"], default="ocr_layout")
-    p.add_argument("--batch-size", type=int, default=8,
-                   help="Pages processed concurrently per batch (default: 8)")
-    p.add_argument("--max-failure-retries", type=int, default=2,
-                   help="Chandra vLLM retries for transient request failures (default: 2)")
-    p.add_argument("--chandra-repeat-retries", type=int, default=1,
-                   help="Chandra SDK retries when it detects repeated output (default: 1)")
-    p.add_argument("--repetition-penalty", type=float, default=1.05,
-                   help="vLLM token repetition penalty for Chandra (1.0 disables it; default: 1.05)")
-    p.add_argument("--frequency-penalty", type=float, default=0.0,
-                   help="vLLM frequency penalty for Chandra (default: 0)")
-    p.add_argument("--presence-penalty", type=float, default=0.0,
-                   help="vLLM presence penalty for Chandra (default: 0)")
-    p.add_argument("--disable-repetition-detection", action="store_true",
+    p.add_argument("--chandra-prompt-type", choices=["ocr_layout", "ocr"])
+    p.add_argument("--batch-size", type=int, help="Pages processed concurrently per batch")
+    p.add_argument("--max-failure-retries", type=int,
+                   help="Chandra vLLM retries for transient request failures")
+    p.add_argument("--chandra-repeat-retries", type=int,
+                   help="Chandra retries when it detects repeated output")
+    p.add_argument("--repetition-penalty", type=float,
+                   help="vLLM token repetition penalty for Chandra")
+    p.add_argument("--frequency-penalty", type=float,
+                   help="vLLM frequency penalty for Chandra")
+    p.add_argument("--presence-penalty", type=float,
+                   help="vLLM presence penalty for Chandra")
+    p.add_argument("--disable-repetition-detection", action="store_true", default=None,
                    help="Disable vLLM's early stop for repeated n-gram patterns")
-    p.add_argument("--repetition-min-pattern-size", type=int, default=1)
-    p.add_argument("--repetition-max-pattern-size", type=int, default=5)
-    p.add_argument("--repetition-min-count", type=int, default=8,
-                   help="Stop when an n-gram repeats this many times (default: 8)")
-    p.add_argument("--base-url", default="http://localhost:8000/v1")
-    p.add_argument("--api-key", default="EMPTY")
-    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--repetition-min-pattern-size", type=int)
+    p.add_argument("--repetition-max-pattern-size", type=int)
+    p.add_argument("--repetition-min-count", type=int,
+                   help="Stop when an n-gram repeats this many times")
+    p.add_argument("--base-url")
+    p.add_argument("--api-key")
+    p.add_argument("-o", "--output")
     p.add_argument("--limit", type=int, help="Process only first N examples (smoke test)")
     p.add_argument("--max-tokens", type=int,
-                   help="Output ceiling (default: 4096 for Chandra, 12288 for Qwen)")
-    p.add_argument("--timeout", type=float, default=600)
-    p.add_argument("--allow-thinking", action="store_true")
-    p.add_argument("--check-images", action="store_true", help="SHA256 verify images against manifest")
-    p.add_argument("--fsync", action="store_true", help="Durable write after every page (slower)")
+                   help="Output ceiling (defaults: 4096 for Chandra, 12288 for Qwen)")
+    p.add_argument("--timeout", type=float)
+    p.add_argument("--allow-thinking", action="store_true", default=None)
+    p.add_argument("--check-images", action="store_true", default=None,
+                   help="SHA256 verify images against manifest")
+    p.add_argument("--fsync", action="store_true", default=None,
+                   help="Durable write after every page (slower)")
     p.set_defaults(fn=run)
 
     p = sub.add_parser("compare", help="Compare CER/WER across runs on exactly common successful documents")
@@ -950,15 +1055,8 @@ def main():
     args = parser.parse_args()
     if args.command == "prepare" and args.dev_size < 1:
         parser.error("--dev-size must be positive")
-    if args.command == "run" and args.max_tokens is None:
-        args.max_tokens = 4096 if args.backend == "chandra-vllm" else 12288
-    if args.command == "run" and (args.max_tokens < 1 or args.batch_size < 1
-                                   or args.max_failure_retries < 0 or args.chandra_repeat_retries < 0
-                                   or args.repetition_penalty <= 0 or args.repetition_min_count < 2
-                                   or args.repetition_min_pattern_size < 1
-                                   or args.repetition_max_pattern_size < args.repetition_min_pattern_size
-                                   or (args.limit is not None and args.limit < 1)):
-        parser.error("--max-tokens, --batch-size and --limit must be positive; retry count cannot be negative")
+    if args.command == "run":
+        apply_run_config(args, parser)
     args.fn(args)
 
 

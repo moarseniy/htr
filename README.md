@@ -4,39 +4,70 @@ The benchmark compares full-page OCR predictions with Label Studio ground truth 
 
 ## Backends
 
-- `chandra-vllm`: Chandra OCR 2 through the Chandra SDK's vLLM client.
+- `chandra-vllm`: Chandra OCR 2 through its OpenAI-compatible vLLM endpoint, with Chandra image and output helpers.
 - `openai`: an OpenAI-compatible vLLM endpoint, intended for Qwen.
 
-The vLLM server runs separately from the benchmark. Start the appropriate model server first, then point `--base-url` at its `/v1` endpoint. For Chandra, the SDK provides `chandra_vllm`; for Qwen, use the OpenAI-compatible vLLM server for that model. The benchmark client does not launch a server or choose its GPU topology.
+The vLLM server runs separately from the benchmark. Start the appropriate model server from its local checkpoint first; the benchmark connects to its `/v1` endpoint. The benchmark client does not launch a server or choose its GPU topology.
 
-## Run
+## Run from a config
 
-Chandra OCR 2, using batches of eight pages by default:
-
-```bash
-python fullpage_ocr_benchmark.py run \
-  --manifest target_manifest.jsonl \
-  --backend chandra-vllm \
-  --model chandra \
-  --base-url http://localhost:8000/v1 \
-  --batch-size 8 \
-  --max-tokens 4096 \
-  --split dev \
-  --output runs/chandra-vllm
-```
-
-Qwen through an OpenAI-compatible vLLM endpoint:
+Set the three local paths once. Copy the template, edit the paths, then load them into the shell:
 
 ```bash
-python fullpage_ocr_benchmark.py run \
-  --manifest target_manifest.jsonl \
-  --backend openai \
-  --model Qwen/Qwen3.5-27B \
-  --base-url http://localhost:8000/v1 \
-  --batch-size 8 \
-  --split dev \
-  --output runs/qwen-vllm
+cp configs/local.env.example configs/local.env
+# Edit configs/local.env with the manifest and local model directories.
+set -a
+source configs/local.env
+set +a
 ```
+
+The run configs expand `${HTR_MANIFEST}` and resolve relative output paths from `configs/`. The model path is used only when starting its server; `model` in the run config is the alias served by vLLM.
+
+If the Chandra server is not already running on port 8000, start vLLM directly from the local checkpoint directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve "$CHANDRA_MODEL_DIR" \
+  --served-model-name chandra \
+  --dtype bfloat16 \
+  --max-model-len 18000 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.85 \
+  --enable-prefix-caching \
+  --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":6291456}' \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Run the 8-page pilot, then the full validation set:
+
+```bash
+python fullpage_ocr_benchmark.py run --config configs/chandra-pilot.json
+python fullpage_ocr_benchmark.py run --config configs/chandra-full-rp105.json
+```
+
+Run the baseline with repetition penalty disabled, then compare:
+
+```bash
+python fullpage_ocr_benchmark.py run --config configs/chandra-full-rp100.json
+python fullpage_ocr_benchmark.py compare \
+  runs/chandra-full-rp105 runs/chandra-full-rp100 \
+  --csv runs/chandra-repetition-comparison.csv
+```
+
+Start Qwen's local vLLM server on both GPUs and port 8001, then run its config:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 vllm serve "$QWEN_MODEL_DIR" \
+  --served-model-name Qwen/Qwen3.5-27B \
+  --tensor-parallel-size 2 \
+  --host 127.0.0.1 \
+  --port 8001
+
+python fullpage_ocr_benchmark.py run --config configs/qwen-full.json
+```
+
+Each JSON file contains the endpoint, batch size, retry policy, repetition controls, split, and output folder. `HTR_MANIFEST` selects the same validation manifest for each run. Change values in a JSON file when you want a different setup; the model checkpoint path is used by the separate vLLM server, while the `model` field here is the server's served name.
 
 For Chandra, the runner sends concurrent OpenAI-compatible requests to vLLM and uses Chandra's image scaling, prompt mapping, and output parsers. For the OpenAI-compatible backend, the client also submits concurrent requests so vLLM can use continuous batching. `--batch-size` controls client-side concurrency. Start with a modest value and increase it while monitoring GPU memory and server throughput.
 
@@ -67,5 +98,5 @@ Runs must use the same manifest hash. The comparison uses exactly the pages with
 ## Dependencies
 
 ```bash
-pip install pillow rapidfuzz beautifulsoup4 openai requests chandra-ocr
+pip install -r requirements.txt
 ```
