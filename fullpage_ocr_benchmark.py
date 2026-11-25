@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end full-page OCR benchmark of Label Studio documents.
 
-Backends: OpenAI-compatible (vLLM/Qwen), Chandra OCR 2 (HuggingFace or vLLM).
+Backends: OpenAI-compatible vLLM (Qwen), Chandra OCR 2 vLLM.
 No line/word segmentation, no manual image enhancement or downsampling.
 
 Commands:
@@ -9,8 +9,7 @@ Commands:
   run      : OCR -> append-only result file; interrupted runs can be resumed
   compare  : compare separate model runs on overlapping tasks
 
-Requires: pip install pillow rapidfuzz beautifulsoup4 openai
-For Chandra: pip install 'chandra-ocr[hf]' (or chandra-ocr for server mode)
+Requires: pip install pillow rapidfuzz beautifulsoup4 openai chandra-ocr
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -345,6 +345,19 @@ class OpenAIBackend:
             "tokens": getattr(getattr(reply, "usage", None), "total_tokens", None),
         }
 
+    def infer_many(self, paths: list[Path], max_workers: int) -> list[dict]:
+        """Send requests concurrently so vLLM can continuously batch them."""
+        def safe_infer(path: Path) -> dict:
+            try:
+                return self.infer(path)
+            except Exception as exc:
+                return {"_error": f"{type(exc).__name__}: {exc}"}
+
+        if len(paths) == 1:
+            return [safe_infer(paths[0])]
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as pool:
+            return list(pool.map(safe_infer, paths))
+
 
 
 def chandra_html_to_text(html: str) -> str:
@@ -378,41 +391,87 @@ def chandra_html_to_text(html: str) -> str:
 class ChandraBackend:
     def __init__(self, args):
         # Set before import: pydantic settings may read environment at module import.
-        if args.chandra_checkpoint:
-            os.environ["MODEL_CHECKPOINT"] = args.chandra_checkpoint
-        if args.backend == "chandra-vllm":
-            os.environ["VLLM_API_BASE"] = args.base_url
-            os.environ["VLLM_API_KEY"] = args.api_key
-            os.environ["VLLM_MODEL_NAME"] = args.model
+        os.environ["VLLM_API_BASE"] = args.base_url
+        os.environ["VLLM_API_KEY"] = args.api_key
+        os.environ["VLLM_MODEL_NAME"] = args.model
         from chandra.model import InferenceManager
         from chandra.model.schema import BatchInputItem
+        from chandra.model.util import detect_repeat_token
         self.BatchInputItem = BatchInputItem
-        self.manager = InferenceManager(method="hf" if args.backend == "chandra-hf" else "vllm")
+        self.detect_repeat_token = detect_repeat_token
+        self.manager = InferenceManager(method="vllm")
         self.args = args
 
-    def infer(self, path: Path) -> dict:
+    def infer_many(self, paths: list[Path], max_workers: int) -> list[dict]:
+        """Send a whole batch through Chandra's vLLM client."""
         from PIL import Image
-        with Image.open(path) as source:
-            image = source.convert("RGB")
-        item = self.BatchInputItem(image=image, prompt_type=self.args.chandra_prompt_type)
-        result = self.manager.generate([item], max_output_tokens=self.args.max_tokens,
-                                       include_headers_footers=True,
-                                       include_images=True)[0]
-        if result.error:
-            raise RuntimeError(f"Chandra reported an error: {result.error}")
-        html = result.html or ""
-        # Evaluate only visible text, not HTML tags/bboxes/Markdown markup.
-        prediction = chandra_html_to_text(html)
-        if not prediction and html.strip():
-            raise ValueError("Chandra HTML was nonempty but no text could be extracted")
-        return {
-            "prediction": prediction,
-            "raw": result.raw or "",
-            "html": html,
-            "markdown": result.markdown or "",
-            "finish_reason": "unknown",  # Chandra SDK does not expose finish_reason.
-            "tokens": getattr(result, "token_count", None),
-        }
+        output: list[dict | None] = [None] * len(paths)
+        items = []
+        positions = []
+        for position, path in enumerate(paths):
+            try:
+                with Image.open(path) as source:
+                    image = source.convert("RGB")
+                items.append(self.BatchInputItem(image=image, prompt_type=self.args.chandra_prompt_type))
+                positions.append(position)
+            except Exception as exc:
+                output[position] = {"_error": f"{type(exc).__name__}: {exc}"}
+
+        if not items:
+            return [r or {"_error": "Image preparation produced no batch items"} for r in output]
+
+        try:
+            results = self.manager.generate(
+                items,
+                max_output_tokens=self.args.max_tokens,
+                max_workers=min(max_workers, len(items)),
+                # Prevent repeated stochastic retries on outputs that hit a loop.
+                max_retries=0,
+                max_failure_retries=self.args.max_failure_retries,
+                include_headers_footers=True,
+                include_images=True,
+            )
+            if len(results) != len(items):
+                raise RuntimeError(f"Chandra returned {len(results)} results for {len(items)} images")
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            for position in positions:
+                output[position] = {"_error": message}
+            return [r or {"_error": message} for r in output]
+
+        for position, result in zip(positions, results):
+            try:
+                if result.error:
+                    raise RuntimeError("Chandra vLLM request failed; see server log")
+                html = result.html or ""
+                raw = result.raw or ""
+                # Evaluate visible text, not HTML tags/bboxes/Markdown markup.
+                prediction = chandra_html_to_text(html)
+                if not prediction and html.strip():
+                    raise ValueError("Chandra HTML was nonempty but no text could be extracted")
+                record = {
+                    "prediction": prediction,
+                    "raw": raw,
+                    "html": html,
+                    "markdown": result.markdown or "",
+                    "finish_reason": "unknown",  # Chandra SDK does not expose finish_reason.
+                    "tokens": getattr(result, "token_count", None),
+                }
+                repeated = self.detect_repeat_token(raw) or (
+                    len(raw) > 50 and self.detect_repeat_token(raw, cut_from_end=50)
+                )
+                if repeated:
+                    record["_error"] = "Chandra output contains a repeated-token loop"
+                output[position] = record
+            except Exception as exc:
+                output[position] = {
+                    "raw": getattr(result, "raw", "") or "",
+                    "html": getattr(result, "html", "") or "",
+                    "markdown": getattr(result, "markdown", "") or "",
+                    "tokens": getattr(result, "token_count", None),
+                    "_error": f"{type(exc).__name__}: {exc}",
+                }
+        return [r or {"_error": "Chandra returned no result for this image"} for r in output]
 
 
 def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
@@ -420,7 +479,16 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
     errors = [r for r in rows if r.get("status") != "ok"]
     chars = sum(r["char_count"] for r in ok)
     words = sum(r["word_count"] for r in ok)
-    seconds = sum(r.get("seconds", 0) for r in ok)
+    # Batched rows repeat the batch wall time; count it once per batch.
+    batch_seconds = {}
+    legacy_seconds = 0.0
+    for row in rows:
+        batch_id = row.get("batch_id")
+        if batch_id is not None:
+            batch_seconds[str(batch_id)] = float(row.get("batch_seconds", 0))
+        elif row.get("status") == "ok":
+            legacy_seconds += float(row.get("seconds", 0))
+    seconds = sum(batch_seconds.values()) + legacy_seconds
     return {
         "expected_pages": expected_pages,
         "pages_ok": len(ok),
@@ -432,6 +500,7 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
         "mean_page_wer": sum(r["wer"] for r in ok) / len(ok) if ok else None,
         "total_seconds": round(seconds, 2),
         "mean_seconds_per_page": round(seconds / len(ok), 2) if ok else None,
+        "pages_per_second": round(len(ok) / seconds, 4) if seconds else None,
     }
 
 
@@ -450,17 +519,21 @@ def run(args):
     run_dir.mkdir(parents=True, exist_ok=True)
     config_path = run_dir / "run_config.json"
     config = {
-        "schema_version": 1,
+        "schema_version": 2,
         "manifest_sha256": digest_file(manifest),
         "split": args.split,
         "limit": args.limit,
         "backend": args.backend,
-        "model": args.model if args.backend in ("openai", "chandra-vllm") else args.chandra_checkpoint or "datalab-to/chandra-ocr-2",
-        "base_url": args.base_url if args.backend != "chandra-hf" else None,
+        "model": args.model,
+        "base_url": args.base_url,
         "max_tokens": args.max_tokens,
-        "chandra_prompt_type": args.chandra_prompt_type if args.backend.startswith("chandra") else None,
+        "batch_size": args.batch_size,
+        "chandra_prompt_type": args.chandra_prompt_type if args.backend == "chandra-vllm" else None,
+        "chandra_repeat_retries": 0,
+        "chandra_failure_retries": args.max_failure_retries if args.backend == "chandra-vllm" else None,
         "allow_thinking": args.allow_thinking if args.backend == "openai" else None,
         "prompt": PROMPT if args.backend == "openai" else "chandra SDK built-in prompt",
+        "timing": "batch wall time; seconds per page is amortized throughput time",
     }
     if config_path.exists():
         old = json.loads(config_path.read_text(encoding="utf-8"))
@@ -479,45 +552,99 @@ def run(args):
         print(f"All {len(selected)} pages were already processed; refreshing summary")
     else:
         backend = OpenAIBackend(args) if args.backend == "openai" else ChandraBackend(args)
-        print(f"Backend={args.backend}; pages={len(selected)}; completed={len(completed)}; output={run_dir}")
-        # Add one record per finished page. Errors are recorded, but retried on resume.
+        pending = [example for example in selected if str(example["task_id"]) not in completed]
+        batches = [pending[i:i + args.batch_size] for i in range(0, len(pending), args.batch_size)]
+        print(f"Backend={args.backend}; pages={len(selected)}; completed={len(completed)}; "
+              f"batch_size={args.batch_size}; output={run_dir}")
+        # Each batch is appended after it finishes. Failed pages are retried on resume.
         with result_path.open("a", encoding="utf-8") as f:
-            for i, example in enumerate(selected, 1):
-                task_id = str(example["task_id"])
-                if task_id in completed:
-                    continue
-                path = Path(example["image"])
-                start = time.perf_counter()
-                outcome = {"task_id": task_id, "split": example["split"],
-                           "image": str(path), "gt": example["gt"], "timestamp": utc_now()}
-                try:
-                    if not path.is_file():
-                        raise FileNotFoundError(path)
-                    if args.check_images and digest_file(path) != example["image_sha256"]:
-                        raise RuntimeError("Image bytes changed after manifest generation")
-                    pred = backend.infer(path)
-                    outcome.update(pred)
-                    if pred.get("finish_reason") == "length":
-                        raise RuntimeError("Output was truncated (finish_reason=length); increase --max-tokens")
-                    outcome.update(score_page(example["gt"], pred["prediction"]))
-                    outcome["status"] = "ok"
-                    completed.add(task_id)
-                except KeyboardInterrupt:
-                    print("\nInterrupted. Resume with the same command.", file=sys.stderr)
-                    break
-                except Exception as exc:
-                    outcome["status"] = "error"
-                    outcome["error"] = f"{type(exc).__name__}: {exc}"
-                outcome["seconds"] = round(time.perf_counter() - start, 3)
-                f.write(stable_json(outcome) + "\n")
-                f.flush()
-                if args.fsync:
-                    os.fsync(f.fileno())
-                if outcome["status"] == "ok":
-                    print(f"[{i}/{len(selected)}] task={task_id} CER={outcome['cer']:.2%} "
-                          f"WER={outcome['wer']:.2%} {outcome['seconds']:.1f}s", flush=True)
-                else:
-                    print(f"[{i}/{len(selected)}] task={task_id} ERROR: {outcome['error']}", file=sys.stderr, flush=True)
+            for batch_number, batch in enumerate(batches, 1):
+                batch_id = f"{time.time_ns()}-{batch_number}"
+                started = time.perf_counter()
+                valid_indices, paths = [], []
+                errors = {}
+                for index, example in enumerate(batch):
+                    path = Path(example["image"])
+                    try:
+                        if not path.is_file():
+                            raise FileNotFoundError(path)
+                        if args.check_images and digest_file(path) != example["image_sha256"]:
+                            raise RuntimeError("Image bytes changed after manifest generation")
+                        valid_indices.append(index)
+                        paths.append(path)
+                    except Exception as exc:
+                        errors[index] = f"{type(exc).__name__}: {exc}"
+
+                predictions = []
+                if paths:
+                    try:
+                        predictions = backend.infer_many(paths, max_workers=args.batch_size)
+                    except KeyboardInterrupt:
+                        print("\nInterrupted during a batch. Resume with the same command.", file=sys.stderr)
+                        break
+                    except Exception as exc:
+                        message = f"{type(exc).__name__}: {exc}"
+                        predictions = [{"_error": message} for _ in paths]
+                elapsed = time.perf_counter() - started
+                per_page_seconds = elapsed / len(batch)
+                prediction_by_index = dict(zip(valid_indices, predictions))
+                records = []
+
+                for index, example in enumerate(batch):
+                    path = Path(example["image"])
+                    outcome = {
+                        "task_id": str(example["task_id"]),
+                        "split": example["split"],
+                        "image": str(path),
+                        "gt": example["gt"],
+                        "timestamp": utc_now(),
+                        "batch_id": batch_id,
+                        "batch_size": len(batch),
+                        "batch_seconds": round(elapsed, 3),
+                        "seconds": round(per_page_seconds, 3),
+                    }
+                    try:
+                        if index in errors:
+                            raise RuntimeError(errors[index])
+                        pred = prediction_by_index.get(index)
+                        if pred is None:
+                            raise RuntimeError("Backend returned no prediction for this page")
+                        outcome.update({k: v for k, v in pred.items() if k != "_error"})
+                        if pred.get("_error"):
+                            raise RuntimeError(pred["_error"])
+                        if pred.get("finish_reason") == "length":
+                            raise RuntimeError("Output was truncated (finish_reason=length); increase --max-tokens")
+                        if (args.backend == "chandra-vllm" and isinstance(pred.get("tokens"), (int, float))
+                                and pred["tokens"] >= args.max_tokens):
+                            raise RuntimeError(
+                                f"Chandra reached max_output_tokens={args.max_tokens}; "
+                                "output may be truncated or stuck in a repetition loop"
+                            )
+                        outcome.update(score_page(example["gt"], pred["prediction"]))
+                        outcome["status"] = "ok"
+                        completed.add(str(example["task_id"]))
+                    except Exception as exc:
+                        outcome["status"] = "error"
+                        outcome["error"] = f"{type(exc).__name__}: {exc}"
+                    records.append(outcome)
+
+                for outcome in records:
+                    f.write(stable_json(outcome) + "\n")
+                    f.flush()
+                    if args.fsync:
+                        os.fsync(f.fileno())
+                ok_records = [r for r in records if r["status"] == "ok"]
+                errors_count = len(records) - len(ok_records)
+                print(f"[batch {batch_number}/{len(batches)}] pages={len(batch)} "
+                      f"ok={len(ok_records)} errors={errors_count} wall={elapsed:.1f}s "
+                      f"throughput={len(batch) / elapsed:.3f} pages/s", flush=True)
+                for outcome in records:
+                    if outcome["status"] == "ok":
+                        print(f"  task={outcome['task_id']} CER={outcome['cer']:.2%} "
+                              f"WER={outcome['wer']:.2%}", flush=True)
+                    else:
+                        print(f"  task={outcome['task_id']} ERROR: {outcome['error']}",
+                              file=sys.stderr, flush=True)
 
     # Latest attempt per task, so a failed attempt followed by success is counted once.
     attempts = {str(r["task_id"]): r for r in read_jsonl(result_path)} if result_path.exists() else {}
@@ -551,7 +678,7 @@ def compare(args):
     if not common:
         raise ValueError("There are no common successful documents across runs")
     print(f"Same-document comparison: {len(common)} documents")
-    print(f"{'Run':<26} {'CER':>11} {'WER':>11} {'sec/page':>11}")
+    print(f"{'Run':<26} {'CER':>11} {'WER':>11} {'eff sec/page':>14}")
     compare_rows = []
     for name, (_, records) in runs.items():
         sample = [records[k] for k in common]
@@ -584,13 +711,17 @@ def parser_factory():
     p.add_argument("--overwrite", action="store_true")
     p.set_defaults(fn=prepare)
 
-    p = sub.add_parser("run", help="Run a single backend; resumable, one full page per request")
+    p = sub.add_parser("run", help="Run a vLLM backend in resumable batches")
     p.add_argument("--manifest", required=True)
     p.add_argument("--split", choices=["dev", "test", "all"], default="dev")
-    p.add_argument("--backend", choices=["openai", "chandra-hf", "chandra-vllm"], required=True)
+    p.add_argument("--backend", choices=["openai", "chandra-vllm"], required=True,
+                   help="OpenAI-compatible vLLM for Qwen, or Chandra's vLLM client")
     p.add_argument("--model", help="vLLM model name (defaults: Qwen/Qwen3.5-27B or chandra)")
-    p.add_argument("--chandra-checkpoint", help="Optional local model folder for chandra-hf")
     p.add_argument("--chandra-prompt-type", choices=["ocr_layout", "ocr"], default="ocr_layout")
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="Pages processed concurrently per batch (default: 8)")
+    p.add_argument("--max-failure-retries", type=int, default=2,
+                   help="Chandra vLLM retries for transient request failures; repeat-output retries stay disabled")
     p.add_argument("--base-url", default="http://localhost:8000/v1")
     p.add_argument("--api-key", default="EMPTY")
     p.add_argument("-o", "--output", required=True)
@@ -614,8 +745,10 @@ def main():
     args = parser.parse_args()
     if args.command == "prepare" and args.dev_size < 1:
         parser.error("--dev-size must be positive")
-    if args.command == "run" and (args.max_tokens < 1 or (args.limit is not None and args.limit < 1)):
-        parser.error("--max-tokens and --limit must be positive")
+    if args.command == "run" and (args.max_tokens < 1 or args.batch_size < 1
+                                   or args.max_failure_retries < 0
+                                   or (args.limit is not None and args.limit < 1)):
+        parser.error("--max-tokens, --batch-size and --limit must be positive; retry count cannot be negative")
     args.fn(args)
 
 
