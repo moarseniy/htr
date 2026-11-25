@@ -30,6 +30,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from urllib.parse import unquote, urlparse
 
 
@@ -394,16 +395,135 @@ class ChandraBackend:
         os.environ["VLLM_API_BASE"] = args.base_url
         os.environ["VLLM_API_KEY"] = args.api_key
         os.environ["VLLM_MODEL_NAME"] = args.model
-        from chandra.model import InferenceManager
+        from openai import OpenAI
         from chandra.model.schema import BatchInputItem
-        from chandra.model.util import detect_repeat_token
+        from chandra.model.util import detect_repeat_token, scale_to_fit
+        from chandra.model.vllm import image_to_base64
+        from chandra.output import parse_html, parse_markdown
+        from chandra.prompts import PROMPT_MAPPING
         self.BatchInputItem = BatchInputItem
         self.detect_repeat_token = detect_repeat_token
-        self.manager = InferenceManager(method="vllm")
+        self.scale_to_fit = scale_to_fit
+        self.image_to_base64 = image_to_base64
+        self.parse_html = parse_html
+        self.parse_markdown = parse_markdown
+        self.prompt_mapping = PROMPT_MAPPING
+        self.client = OpenAI(base_url=args.base_url, api_key=args.api_key,
+                             timeout=args.timeout, max_retries=0)
+        self.repetition_detection_enabled = not args.disable_repetition_detection
+        self.repetition_detection_lock = Lock()
         self.args = args
 
+    def _request(self, item, temperature: float, top_p: float):
+        prompt_type = item.prompt_type or "ocr_layout"
+        prompt = item.prompt or self.prompt_mapping[prompt_type]
+        image = self.scale_to_fit(item.image)
+        image_b64 = self.image_to_base64(image)
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            {"type": "text", "text": prompt},
+        ]}]
+
+        extra_body = {
+            "repetition_penalty": self.args.repetition_penalty,
+            "frequency_penalty": self.args.frequency_penalty,
+            "presence_penalty": self.args.presence_penalty,
+        }
+        if self.repetition_detection_enabled:
+            extra_body["repetition_detection"] = {
+                "max_pattern_size": self.args.repetition_max_pattern_size,
+                "min_pattern_size": self.args.repetition_min_pattern_size,
+                "min_count": self.args.repetition_min_count,
+            }
+
+        def create(body):
+            return self.client.chat.completions.create(
+                model=self.args.model,
+                messages=messages,
+                max_tokens=self.args.max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                extra_body=body,
+            )
+
+        try:
+            return create(extra_body)
+        except Exception as exc:
+            # Older/custom vLLM servers may not expose the n-gram detector.
+            # Fall back to repetition penalties and remember that for this run.
+            if self.repetition_detection_enabled and "repetition_detection" in str(exc).lower():
+                with self.repetition_detection_lock:
+                    self.repetition_detection_enabled = False
+                extra_body.pop("repetition_detection", None)
+                return create(extra_body)
+            raise
+
+    def _to_record(self, completion) -> dict:
+        choice = completion.choices[0]
+        raw = choice.message.content or ""
+        if isinstance(raw, list):
+            raw = "\n".join(str(x.get("text", "")) for x in raw if isinstance(x, dict))
+        raw = str(raw)
+        html = self.parse_html(raw, include_headers_footers=True, include_images=True)
+        markdown = self.parse_markdown(raw, include_headers_footers=True, include_images=True)
+        prediction = chandra_html_to_text(html or "")
+        finish_reason = choice.finish_reason
+        tokens = getattr(getattr(completion, "usage", None), "completion_tokens", None)
+        repeated = (
+            finish_reason == "repetition"
+            or self.detect_repeat_token(raw)
+            or (len(raw) > 50 and self.detect_repeat_token(raw, cut_from_end=50))
+        )
+        return {
+            "prediction": prediction,
+            "raw": raw,
+            "html": html or "",
+            "markdown": markdown or "",
+            "finish_reason": finish_reason,
+            "tokens": tokens,
+            "loop_detected": bool(repeated),
+            "token_limit_reached": finish_reason == "length" or (
+                isinstance(tokens, (int, float)) and tokens >= self.args.max_tokens
+            ),
+            "repetition_detection_enabled": self.repetition_detection_enabled,
+        }
+
+    def _generate_one(self, item, repeat_retries: int) -> dict:
+        last_record = None
+        initial_loop_detected = False
+        for attempt in range(repeat_retries + 1):
+            temperature = 0.0 if attempt == 0 else min(0.2 * attempt, 0.8)
+            top_p = 0.1 if attempt == 0 else 0.95
+            completion = None
+            for failure_attempt in range(self.args.max_failure_retries + 1):
+                try:
+                    completion = self._request(item, temperature, top_p)
+                    break
+                except Exception as exc:
+                    if failure_attempt >= self.args.max_failure_retries:
+                        return {"_error": f"{type(exc).__name__}: {exc}"}
+                    time.sleep(2 * (failure_attempt + 1))
+            try:
+                last_record = self._to_record(completion)
+            except Exception as exc:
+                return {"_error": f"{type(exc).__name__}: {exc}"}
+            if attempt == 0:
+                initial_loop_detected = last_record["loop_detected"]
+            last_record["initial_loop_detected"] = initial_loop_detected
+            last_record["repeat_retries_used"] = attempt
+            last_record["loop_recovered"] = initial_loop_detected and not last_record["loop_detected"]
+            if not last_record["loop_detected"] or attempt >= repeat_retries:
+                return last_record
+        return last_record or {"_error": "Chandra returned no completion"}
+
+    def _generate_items(self, items, max_workers: int, repeat_retries: int) -> list[dict]:
+        if len(items) == 1:
+            return [self._generate_one(items[0], repeat_retries)]
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
+            return list(pool.map(lambda item: self._generate_one(item, repeat_retries), items))
+
     def infer_many(self, paths: list[Path], max_workers: int) -> list[dict]:
-        """Send a whole batch through Chandra's vLLM client."""
+        """Send a whole batch concurrently through vLLM's OpenAI-compatible API."""
         from PIL import Image
         output: list[dict | None] = [None] * len(paths)
         items = []
@@ -421,64 +541,77 @@ class ChandraBackend:
             return [r or {"_error": "Image preparation produced no batch items"} for r in output]
 
         try:
-            results = self.manager.generate(
-                items,
-                max_output_tokens=self.args.max_tokens,
-                max_workers=min(max_workers, len(items)),
-                # Prevent repeated stochastic retries on outputs that hit a loop.
-                max_retries=0,
-                max_failure_retries=self.args.max_failure_retries,
-                include_headers_footers=True,
-                include_images=True,
-            )
-            if len(results) != len(items):
-                raise RuntimeError(f"Chandra returned {len(results)} results for {len(items)} images")
+            results = self._generate_items(items, max_workers, self.args.chandra_repeat_retries)
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             for position in positions:
                 output[position] = {"_error": message}
             return [r or {"_error": message} for r in output]
 
+        item_by_position = dict(zip(positions, items))
         for position, result in zip(positions, results):
             try:
-                if result.error:
-                    raise RuntimeError("Chandra vLLM request failed; see server log")
-                html = result.html or ""
-                raw = result.raw or ""
-                # Evaluate visible text, not HTML tags/bboxes/Markdown markup.
-                prediction = chandra_html_to_text(html)
-                if not prediction and html.strip():
-                    raise ValueError("Chandra HTML was nonempty but no text could be extracted")
-                record = {
-                    "prediction": prediction,
-                    "raw": raw,
-                    "html": html,
-                    "markdown": result.markdown or "",
-                    "finish_reason": "unknown",  # Chandra SDK does not expose finish_reason.
-                    "tokens": getattr(result, "token_count", None),
-                }
-                repeated = self.detect_repeat_token(raw) or (
-                    len(raw) > 50 and self.detect_repeat_token(raw, cut_from_end=50)
-                )
-                if repeated:
-                    record["_error"] = "Chandra output contains a repeated-token loop"
-                output[position] = record
+                output[position] = result
             except Exception as exc:
-                output[position] = {
-                    "raw": getattr(result, "raw", "") or "",
-                    "html": getattr(result, "html", "") or "",
-                    "markdown": getattr(result, "markdown", "") or "",
-                    "tokens": getattr(result, "token_count", None),
-                    "_error": f"{type(exc).__name__}: {exc}",
-                }
+                output[position] = {"_error": f"{type(exc).__name__}: {exc}"}
+
+        # If the layout-oriented response still loops or hits its ceiling, try the
+        # model's plain OCR prompt once as a bounded fallback. Keep both attempts.
+        fallback_positions = [
+            position for position in positions
+            if output[position]
+            and not output[position].get("_error")
+            and (output[position].get("loop_detected") or output[position].get("token_limit_reached"))
+        ]
+        if self.args.chandra_prompt_type != "ocr" and fallback_positions:
+            fallback_items = [
+                self.BatchInputItem(image=item_by_position[position].image, prompt_type="ocr")
+                for position in fallback_positions
+            ]
+            try:
+                fallback_results = self._generate_items(fallback_items, max_workers, repeat_retries=0)
+                for position, fallback_result in zip(fallback_positions, fallback_results):
+                    first = output[position]
+                    try:
+                        fallback = fallback_result
+                        if fallback.get("_error"):
+                            raise RuntimeError(fallback["_error"])
+                        fallback.update({
+                            "initial_prediction": first.get("prediction", ""),
+                            "initial_raw": first.get("raw", ""),
+                            "initial_tokens": first.get("tokens"),
+                            "initial_loop_detected": first.get("initial_loop_detected",
+                                                                first.get("loop_detected", False)),
+                            "initial_token_limit_reached": first.get("token_limit_reached", False),
+                            "final_loop_detected": fallback.get("loop_detected", False),
+                            "final_token_limit_reached": fallback.get("token_limit_reached", False),
+                            "loop_detected": first.get("initial_loop_detected", first.get("loop_detected", False))
+                                             or fallback.get("loop_detected", False),
+                            "token_limit_reached": (first.get("token_limit_reached", False)
+                                                     or fallback.get("token_limit_reached", False)),
+                            "loop_fallback_used": True,
+                            "loop_fallback_prompt_type": "ocr",
+                        })
+                        output[position] = fallback
+                    except Exception as exc:
+                        # Keep and score the original model response if fallback itself fails.
+                        first["loop_fallback_used"] = True
+                        first["loop_fallback_prompt_type"] = "ocr"
+                        first["loop_fallback_error"] = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:
+                for position in fallback_positions:
+                    output[position]["loop_fallback_used"] = True
+                    output[position]["loop_fallback_prompt_type"] = "ocr"
+                    output[position]["loop_fallback_error"] = f"{type(exc).__name__}: {exc}"
         return [r or {"_error": "Chandra returned no result for this image"} for r in output]
 
 
 def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
     ok = [r for r in rows if r.get("status") == "ok"]
     errors = [r for r in rows if r.get("status") != "ok"]
-    chars = sum(r["char_count"] for r in ok)
-    words = sum(r["word_count"] for r in ok)
+    scored = [r for r in rows if "char_count" in r and "word_count" in r]
+    chars = sum(r["char_count"] for r in scored)
+    words = sum(r["word_count"] for r in scored)
     # Batched rows repeat the batch wall time; count it once per batch.
     batch_seconds = {}
     legacy_seconds = 0.0
@@ -489,18 +622,27 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
         elif row.get("status") == "ok":
             legacy_seconds += float(row.get("seconds", 0))
     seconds = sum(batch_seconds.values()) + legacy_seconds
+    initial_loops = sum(bool(r.get("initial_loop_detected", r.get("loop_detected", False))) for r in scored)
+    final_loops = sum(bool(r.get("final_loop_detected", r.get("loop_detected", False))) for r in scored)
+    fallback_pages = sum(bool(r.get("loop_fallback_used")) for r in scored)
+    token_limited = sum(bool(r.get("token_limit_reached")) for r in scored)
     return {
         "expected_pages": expected_pages,
         "pages_ok": len(ok),
         "pages_failed": len(errors),
-        "pages_pending": max(0, expected_pages - len(ok) - len(errors)),
-        "cer": sum(r["char_edits"] for r in ok) / chars if chars else None,
-        "wer": sum(r["word_edits"] for r in ok) / words if words else None,
-        "mean_page_cer": sum(r["cer"] for r in ok) / len(ok) if ok else None,
-        "mean_page_wer": sum(r["wer"] for r in ok) / len(ok) if ok else None,
+        "pages_scored": len(scored),
+        "pages_pending": max(0, expected_pages - len(scored)),
+        "pages_with_initial_loop": initial_loops,
+        "pages_with_final_loop": final_loops,
+        "pages_using_ocr_fallback": fallback_pages,
+        "pages_at_token_limit": token_limited,
+        "cer": sum(r["char_edits"] for r in scored) / chars if chars else None,
+        "wer": sum(r["word_edits"] for r in scored) / words if words else None,
+        "mean_page_cer": sum(r["cer"] for r in scored) / len(scored) if scored else None,
+        "mean_page_wer": sum(r["wer"] for r in scored) / len(scored) if scored else None,
         "total_seconds": round(seconds, 2),
-        "mean_seconds_per_page": round(seconds / len(ok), 2) if ok else None,
-        "pages_per_second": round(len(ok) / seconds, 4) if seconds else None,
+        "mean_seconds_per_page": round(seconds / len(scored), 2) if scored else None,
+        "pages_per_second": round(len(scored) / seconds, 4) if seconds else None,
     }
 
 
@@ -519,7 +661,7 @@ def run(args):
     run_dir.mkdir(parents=True, exist_ok=True)
     config_path = run_dir / "run_config.json"
     config = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest_sha256": digest_file(manifest),
         "split": args.split,
         "limit": args.limit,
@@ -529,8 +671,20 @@ def run(args):
         "max_tokens": args.max_tokens,
         "batch_size": args.batch_size,
         "chandra_prompt_type": args.chandra_prompt_type if args.backend == "chandra-vllm" else None,
-        "chandra_repeat_retries": 0,
+        "chandra_repeat_retries": args.chandra_repeat_retries if args.backend == "chandra-vllm" else None,
+        "chandra_fallback_repeat_retries": 0 if args.backend == "chandra-vllm" else None,
         "chandra_failure_retries": args.max_failure_retries if args.backend == "chandra-vllm" else None,
+        "chandra_repetition_penalty": args.repetition_penalty if args.backend == "chandra-vllm" else None,
+        "chandra_frequency_penalty": args.frequency_penalty if args.backend == "chandra-vllm" else None,
+        "chandra_presence_penalty": args.presence_penalty if args.backend == "chandra-vllm" else None,
+        "chandra_repetition_detection": ({
+            "max_pattern_size": args.repetition_max_pattern_size,
+            "min_pattern_size": args.repetition_min_pattern_size,
+            "min_count": args.repetition_min_count,
+        } if args.backend == "chandra-vllm" and not args.disable_repetition_detection else None),
+        "chandra_repetition_detection_requested": (not args.disable_repetition_detection
+                                                     if args.backend == "chandra-vllm" else None),
+        "chandra_loop_policy": "penalty, n-gram early stop, bounded retries, OCR fallback; score final output" if args.backend == "chandra-vllm" else None,
         "allow_thinking": args.allow_thinking if args.backend == "openai" else None,
         "prompt": PROMPT if args.backend == "openai" else "chandra SDK built-in prompt",
         "timing": "batch wall time; seconds per page is amortized throughput time",
@@ -544,12 +698,15 @@ def run(args):
 
     result_path = run_dir / "results.jsonl"
     previous = read_jsonl(result_path) if result_path.exists() else []
-    completed = {str(r["task_id"]) for r in previous if r.get("status") == "ok"}
+    completed = {
+        str(r["task_id"]) for r in previous
+        if r.get("status") == "ok" or r.get("retryable") is False
+    }
     selected_ids = {str(r["task_id"]) for r in selected}
     if any(r.get("status") == "ok" and str(r["task_id"]) not in selected_ids for r in previous):
         raise ValueError("Existing run contains completed tasks outside the selected manifest subset")
     if len(completed) == len(selected):
-        print(f"All {len(selected)} pages were already processed; refreshing summary")
+        print(f"All {len(selected)} pages are already complete or terminal; refreshing summary")
     else:
         backend = OpenAIBackend(args) if args.backend == "openai" else ChandraBackend(args)
         pending = [example for example in selected if str(example["task_id"]) not in completed]
@@ -611,21 +768,25 @@ def run(args):
                             raise RuntimeError("Backend returned no prediction for this page")
                         outcome.update({k: v for k, v in pred.items() if k != "_error"})
                         if pred.get("_error"):
+                            outcome["inference_error"] = pred["_error"]
                             raise RuntimeError(pred["_error"])
                         if pred.get("finish_reason") == "length":
-                            raise RuntimeError("Output was truncated (finish_reason=length); increase --max-tokens")
-                        if (args.backend == "chandra-vllm" and isinstance(pred.get("tokens"), (int, float))
-                                and pred["tokens"] >= args.max_tokens):
-                            raise RuntimeError(
-                                f"Chandra reached max_output_tokens={args.max_tokens}; "
-                                "output may be truncated or stuck in a repetition loop"
-                            )
+                            outcome["token_limit_reached"] = True
                         outcome.update(score_page(example["gt"], pred["prediction"]))
                         outcome["status"] = "ok"
                         completed.add(str(example["task_id"]))
                     except Exception as exc:
                         outcome["status"] = "error"
                         outcome["error"] = f"{type(exc).__name__}: {exc}"
+                        outcome["retryable"] = True
+                        # Keep every labeled page in the metric denominator. If inference
+                        # returned no text, score it as an empty transcription (all deletions).
+                        if "char_count" not in outcome:
+                            outcome["prediction"] = outcome.get("prediction", "")
+                            try:
+                                outcome.update(score_page(example["gt"], outcome["prediction"]))
+                            except Exception as metric_exc:
+                                outcome["metric_error"] = f"{type(metric_exc).__name__}: {metric_exc}"
                     records.append(outcome)
 
                 for outcome in records:
@@ -640,8 +801,18 @@ def run(args):
                       f"throughput={len(batch) / elapsed:.3f} pages/s", flush=True)
                 for outcome in records:
                     if outcome["status"] == "ok":
+                        flags = []
+                        if outcome.get("initial_loop_detected"):
+                            flags.append("loop-retried")
+                        if outcome.get("loop_fallback_used"):
+                            flags.append("OCR-fallback")
+                        if outcome.get("loop_detected"):
+                            flags.append("loop-remains")
+                        if outcome.get("token_limit_reached"):
+                            flags.append("token-limit")
                         print(f"  task={outcome['task_id']} CER={outcome['cer']:.2%} "
-                              f"WER={outcome['wer']:.2%}", flush=True)
+                              f"WER={outcome['wer']:.2%} "
+                              f"{' '.join(flags)}", flush=True)
                     else:
                         print(f"  task={outcome['task_id']} ERROR: {outcome['error']}",
                               file=sys.stderr, flush=True)
@@ -652,12 +823,17 @@ def run(args):
     summary = summarize_successes(latest, len(selected))
     summary.update({"config": config, "created_at": utc_now()})
     write_json_atomic(run_dir / "summary.json", summary)
-    print(f"OK={summary['pages_ok']}/{summary['expected_pages']}, errors={summary['pages_failed']}, "
+    print(f"OK={summary['pages_ok']}/{summary['expected_pages']}, scored={summary['pages_scored']}, "
+          f"errors={summary['pages_failed']}, "
           f"CER={summary['cer']:.2%} WER={summary['wer']:.2%}" if summary["cer"] is not None
           else f"OK=0/{summary['expected_pages']} (no successful predictions)")
     print(f"Results: {run_dir / 'results.jsonl'}")
+    print(f"Loops initial/final: {summary['pages_with_initial_loop']}/"
+          f"{summary['pages_with_final_loop']}; OCR fallbacks: {summary['pages_using_ocr_fallback']}; "
+          f"token limit: {summary['pages_at_token_limit']}")
     if summary["pages_failed"] or summary["pages_pending"]:
-        print("WARNING: incomplete run; quality metrics cover only successful pages!", file=sys.stderr)
+        print("WARNING: request failures are scored as empty transcriptions; check pages_pending for unscored pages.",
+              file=sys.stderr)
 
 
 def compare(args):
@@ -674,10 +850,13 @@ def compare(args):
     if len({c["manifest_sha256"] for c in configs}) != 1:
         raise ValueError("Runs were produced from different manifest versions; cannot compare")
     common = set.intersection(*(set(r) for _, r in runs.values()))
-    common = {task_id for task_id in common if all(r[task_id].get("status") == "ok" for _, r in runs.values())}
+    common = {
+        task_id for task_id in common
+        if all("char_count" in r[task_id] and "word_count" in r[task_id] for _, r in runs.values())
+    }
     if not common:
-        raise ValueError("There are no common successful documents across runs")
-    print(f"Same-document comparison: {len(common)} documents")
+        raise ValueError("There are no common scored documents across runs")
+    print(f"Same-document comparison: {len(common)} scored documents")
     print(f"{'Run':<26} {'CER':>11} {'WER':>11} {'eff sec/page':>14}")
     compare_rows = []
     for name, (_, records) in runs.items():
@@ -688,12 +867,23 @@ def compare(args):
         for task_id in common:
             r = records[task_id]
             compare_rows.append({"task_id": task_id, "run": name, "image": r["image"],
-                                 "cer": r["cer"], "wer": r["wer"], "seconds": r["seconds"]})
+                                 "cer": r["cer"], "wer": r["wer"], "seconds": r["seconds"],
+                                 "status": r["status"],
+                                 "loop_detected": r.get("loop_detected", False),
+                                 "initial_loop_detected": r.get("initial_loop_detected", False),
+                                 "loop_recovered": r.get("loop_recovered", False),
+                                 "repeat_retries_used": r.get("repeat_retries_used", 0),
+                                 "token_limit_reached": r.get("token_limit_reached", False),
+                                 "loop_fallback_used": r.get("loop_fallback_used", False),
+                                 "repetition_detection_enabled": r.get("repetition_detection_enabled")})
     if args.csv:
         path = Path(args.csv).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["task_id", "run", "image", "cer", "wer", "seconds"])
+            writer = csv.DictWriter(f, fieldnames=["task_id", "run", "image", "cer", "wer", "seconds",
+                                                   "status", "loop_detected", "initial_loop_detected",
+                                                   "loop_recovered", "repeat_retries_used", "token_limit_reached",
+                                                   "loop_fallback_used", "repetition_detection_enabled"])
             writer.writeheader()
             writer.writerows(sorted(compare_rows, key=lambda r: (r["task_id"], r["run"])))
         print(f"Per-page comparison: {path}")
@@ -721,12 +911,27 @@ def parser_factory():
     p.add_argument("--batch-size", type=int, default=8,
                    help="Pages processed concurrently per batch (default: 8)")
     p.add_argument("--max-failure-retries", type=int, default=2,
-                   help="Chandra vLLM retries for transient request failures; repeat-output retries stay disabled")
+                   help="Chandra vLLM retries for transient request failures (default: 2)")
+    p.add_argument("--chandra-repeat-retries", type=int, default=1,
+                   help="Chandra SDK retries when it detects repeated output (default: 1)")
+    p.add_argument("--repetition-penalty", type=float, default=1.05,
+                   help="vLLM token repetition penalty for Chandra (1.0 disables it; default: 1.05)")
+    p.add_argument("--frequency-penalty", type=float, default=0.0,
+                   help="vLLM frequency penalty for Chandra (default: 0)")
+    p.add_argument("--presence-penalty", type=float, default=0.0,
+                   help="vLLM presence penalty for Chandra (default: 0)")
+    p.add_argument("--disable-repetition-detection", action="store_true",
+                   help="Disable vLLM's early stop for repeated n-gram patterns")
+    p.add_argument("--repetition-min-pattern-size", type=int, default=1)
+    p.add_argument("--repetition-max-pattern-size", type=int, default=5)
+    p.add_argument("--repetition-min-count", type=int, default=8,
+                   help="Stop when an n-gram repeats this many times (default: 8)")
     p.add_argument("--base-url", default="http://localhost:8000/v1")
     p.add_argument("--api-key", default="EMPTY")
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--limit", type=int, help="Process only first N examples (smoke test)")
-    p.add_argument("--max-tokens", type=int, default=12288)
+    p.add_argument("--max-tokens", type=int,
+                   help="Output ceiling (default: 4096 for Chandra, 12288 for Qwen)")
     p.add_argument("--timeout", type=float, default=600)
     p.add_argument("--allow-thinking", action="store_true")
     p.add_argument("--check-images", action="store_true", help="SHA256 verify images against manifest")
@@ -745,8 +950,13 @@ def main():
     args = parser.parse_args()
     if args.command == "prepare" and args.dev_size < 1:
         parser.error("--dev-size must be positive")
+    if args.command == "run" and args.max_tokens is None:
+        args.max_tokens = 4096 if args.backend == "chandra-vllm" else 12288
     if args.command == "run" and (args.max_tokens < 1 or args.batch_size < 1
-                                   or args.max_failure_retries < 0
+                                   or args.max_failure_retries < 0 or args.chandra_repeat_retries < 0
+                                   or args.repetition_penalty <= 0 or args.repetition_min_count < 2
+                                   or args.repetition_min_pattern_size < 1
+                                   or args.repetition_max_pattern_size < args.repetition_min_pattern_size
                                    or (args.limit is not None and args.limit < 1)):
         parser.error("--max-tokens, --batch-size and --limit must be positive; retry count cannot be negative")
     args.fn(args)
