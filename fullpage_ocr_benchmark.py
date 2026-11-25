@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""End-to-end full-page OCR benchmark of Label Studio documents.
+
+Backends: OpenAI-compatible (vLLM/Qwen), Chandra OCR 2 (HuggingFace or vLLM).
+No line/word segmentation, no manual image enhancement or downsampling.
+
+Commands:
+  prepare  : Label Studio annotations.json -> immutable dev/test manifest
+  run      : OCR -> append-only result file; interrupted runs can be resumed
+  compare  : compare separate model runs on overlapping tasks
+
+Requires: pip install pillow rapidfuzz beautifulsoup4 openai
+For Chandra: pip install 'chandra-ocr[hf]' (or chandra-ocr for server mode)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import hashlib
+import io
+import json
+import mimetypes
+import os
+import random
+import re
+import sys
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def stable_json(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def digest_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def normalize(text: str) -> str:
+    """Equalize line breaks and spaces but do NOT change spelling/case/punctuation."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def score_page(gt: str, prediction: str) -> dict:
+    """Exact edit-distance CER/WER, including insertions and deletions."""
+    from rapidfuzz.distance import Levenshtein
+
+    a, b = normalize(gt), normalize(prediction)
+    if not a:
+        raise ValueError("Empty normalized ground truth")
+    a_words, b_words = a.split(), b.split()
+    return {
+        "cer": Levenshtein.distance(a, b) / len(a),
+        "wer": Levenshtein.distance(a_words, b_words) / len(a_words),
+        "char_edits": Levenshtein.distance(a, b),
+        "char_count": len(a),
+        "word_edits": Levenshtein.distance(a_words, b_words),
+        "word_count": len(a_words),
+    }
+
+
+def get_gt(task: dict) -> str | None:
+    """Last non-cancelled human annotation, never model predictions."""
+    anns = [a for a in task.get("annotations", [])
+            if isinstance(a, dict) and not a.get("was_cancelled") and a.get("result")]
+    if not anns:
+        return None
+    if len(anns) > 1:
+        print(f"[WARN] task={task.get('id')} has {len(anns)} annotations; selecting latest", file=sys.stderr)
+    # Prefer timestamp over arbitrary export order; preserve last list item on ties.
+    ann = max(enumerate(anns), key=lambda p: (
+        str(p[1].get("updated_at") or p[1].get("created_at") or ""), p[0]
+    ))[1]
+
+    segments = []
+    for idx, r in enumerate(ann["result"]):
+        if not isinstance(r, dict):
+            continue
+        value = r.get("value") or {}
+        texts = value.get("text")
+        if not isinstance(texts, list):
+            continue
+        text = "\n".join(t for t in texts if isinstance(t, str)).strip()
+        if not text:
+            continue
+        y, x = value.get("y"), value.get("x")
+        # If coordinates are absent, retain the original annotation result order.
+        if isinstance(y, (int, float)) and isinstance(x, (int, float)):
+            order = (0, float(y), float(x), idx)
+        elif isinstance(y, (int, float)):
+            order = (0, float(y), 0.0, idx)
+        else:
+            order = (1, idx, 0.0, idx)
+        segments.append((order, text))
+    segments.sort(key=lambda v: v[0])
+    gt = "\n".join(text for _, text in segments).strip()
+    return gt or None
+
+
+def field(task: dict, dotted_path: str):
+    cur = task
+    for part in dotted_path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def build_image_index(root: Path) -> dict[str, list[Path]]:
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+    index = defaultdict(list)
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            index[p.name].append(p.resolve())
+    return index
+
+
+def resolve_image(ref: str, root: Path, index: dict[str, list[Path]]) -> Path:
+    """Support relative paths and Label Studio /data/upload/... references."""
+    if not isinstance(ref, str) or not ref.strip():
+        raise ValueError("data.image must be a nonempty path")
+    if ref.startswith(("http://", "https://")):
+        parsed = urlparse(ref)
+        # We only resolve local copies, NEVER download documents from remote hosts.
+        ref = parsed.path
+    ref = unquote(ref.split("?", 1)[0]).replace("\\", "/")
+    p = Path(ref)
+    candidates = [p] if p.is_absolute() else []
+    candidates.extend([root / ref.lstrip("/"), root / "images" / p.name, root / p.name])
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    matches = index.get(p.name, [])
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous image '{ref}': {len(matches)} files named '{p.name}'")
+    raise FileNotFoundError(f"Image '{ref}' not found under '{root}'")
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSONL in {path}:{n}: {e}") from e
+    return rows
+
+
+def write_jsonl_atomic(path: Path, rows: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(stable_json(row) + "\n")
+    os.replace(temp, path)
+
+
+def write_json_atomic(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def prepare(args):
+    root = Path(args.dataset).expanduser().resolve()
+    source = root / "annotations.json"
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    tasks = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(tasks, list):
+        raise ValueError("annotations.json must be a JSON list of Label Studio tasks")
+    index = build_image_index(root)
+    rows = []
+    skipped = Counter()
+    used_ids = set()
+    for task in tasks:
+        task_id = task.get("id")
+        if task_id is None:
+            skipped["missing_id"] += 1
+            continue
+        tid = str(task_id)
+        if tid in used_ids:
+            raise ValueError(f"Duplicate task id: {tid}")
+        used_ids.add(tid)
+        gt = get_gt(task)
+        if not gt or not normalize(gt):
+            skipped["missing_gt"] += 1
+            continue
+        try:
+            img = resolve_image(field(task, "data.image"), root, index)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"[SKIP] task={tid}: {e}", file=sys.stderr)
+            skipped["image_missing_or_ambiguous"] += 1
+            continue
+        with img.open("rb") as f:
+            from PIL import Image
+            with Image.open(f) as image:
+                image.verify()
+        with img.open("rb") as f:
+            from PIL import Image
+            with Image.open(f) as image:
+                width, height = image.size
+        sha = digest_file(img)
+        group = field(task, args.group_field) if args.group_field else None
+        # When no document ID is provided, exact duplicate images always stay together.
+        group_id = str(group) if group is not None and str(group).strip() else f"sha256:{sha}"
+        rows.append({
+            "task_id": tid,
+            "image": str(img),
+            "gt": gt,
+            "image_sha256": sha,
+            "group_id": group_id,
+            "width": width,
+            "height": height,
+        })
+
+    if len(rows) < 2:
+        raise ValueError("Fewer than 2 valid labeled images found")
+    # Connect all records sharing a group OR the same image, even across group IDs.
+    parent = list(range(len(rows)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(a, b):
+        parent[find(a)] = find(b)
+    by_group, by_sha = {}, {}
+    for i, r in enumerate(rows):
+        for cache, key in ((by_group, r["group_id"]), (by_sha, r["image_sha256"])):
+            if key in cache:
+                union(i, cache[key])
+            else:
+                cache[key] = i
+    # Identical bytes must not have contradictory GT.
+    gt_by_sha = defaultdict(set)
+    for r in rows:
+        gt_by_sha[r["image_sha256"]].add(normalize(r["gt"]))
+    conflicts = sum(len(texts) > 1 for texts in gt_by_sha.values())
+    if conflicts:
+        raise ValueError(f"{conflicts} duplicate image hashes have conflicting GT texts; please review annotations")
+    groups = defaultdict(list)
+    for i, row in enumerate(rows):
+        groups[find(i)].append(i)
+    keys = list(groups)
+    rng = random.Random(args.seed)
+    rng.shuffle(keys)
+    dev_keys = set()
+    dev_count = 0
+    for key in keys:
+        size = len(groups[key])
+        # Prevent ending with empty test split.
+        if dev_count < args.dev_size and len(dev_keys) < len(keys) - 1:
+            dev_keys.add(key)
+            dev_count += size
+    if not dev_keys:
+        raise ValueError("Could not produce dev split; check group field")
+    for key, indices in groups.items():
+        split = "dev" if key in dev_keys else "test"
+        for i in indices:
+            rows[i]["split"] = split
+    rows.sort(key=lambda row: (row["split"], row["task_id"]))
+    output = Path(args.output).expanduser().resolve()
+    if output.exists() and not args.overwrite:
+        raise FileExistsError(f"{output} already exists; use --overwrite explicitly")
+    write_jsonl_atomic(output, rows)
+    print(f"Tasks in source: {len(tasks)}; valid GT/images: {len(rows)}; skipped: {dict(skipped)}")
+    print(f"Manifest: {output}")
+    print(f"Dev: {sum(r['split'] == 'dev' for r in rows)}, test: {sum(r['split'] == 'test' for r in rows)}")
+    print("IMPORTANT: For multi-page documents, specify --group-field data.document_id if available.")
+
+
+def image_as_data_url(path: Path) -> str:
+    from PIL import Image
+    mime, _ = mimetypes.guess_type(path.name)
+    if mime in {"image/jpeg", "image/png", "image/webp"}:
+        blob = path.read_bytes()
+    else:
+        # Container format conversion only, NO resize, crop, denoise or enhancement.
+        with Image.open(path) as image:
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, "PNG")
+            blob = buffer.getvalue()
+        mime = "image/png"
+    return f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}"
+
+
+PROMPT = (
+    "Выполни точную транскрипцию ВСЕГО текста на изображении документа "
+    "(включая рукописный и печатный). Прочитай все строки в естественном порядке. "
+    "Не исправляй орфографию, не угадывай отсутствующие слова, не пересказывай, "
+    "не добавляй комментарии или Markdown. Сохраняй цифры и пунктуацию. "
+    "Верни только распознанный текст."
+)
+
+
+class OpenAIBackend:
+    def __init__(self, args):
+        from openai import OpenAI
+        self.args = args
+        self.client = OpenAI(base_url=args.base_url, api_key=args.api_key,
+                             timeout=args.timeout, max_retries=0)
+
+    def infer(self, path: Path) -> dict:
+        kwargs = {}
+        if not self.args.allow_thinking and "qwen" in self.args.model.lower():
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        reply = self.client.chat.completions.create(
+            model=self.args.model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": PROMPT},
+                {"type": "image_url", "image_url": {"url": image_as_data_url(path)}},
+            ]}],
+            temperature=0,
+            max_tokens=self.args.max_tokens,
+            **kwargs,
+        )
+        choice = reply.choices[0]
+        text = choice.message.content or ""
+        if isinstance(text, list):
+            text = "\n".join(str(x.get("text", "")) for x in text if isinstance(x, dict))
+        return {
+            "prediction": str(text),
+            "raw": str(text),
+            "finish_reason": choice.finish_reason,
+            "tokens": getattr(getattr(reply, "usage", None), "total_tokens", None),
+        }
+
+
+
+def chandra_html_to_text(html: str) -> str:
+    """Extract text without introducing artificial spaces around inline HTML tags.
+
+    For example, ``<b>При</b>вет`` must stay ``Привет``; table cells and
+    paragraphs must remain separated. HTML/layout markup is not part of GT.
+    """
+    from bs4 import BeautifulSoup, NavigableString
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "svg", "img"]):
+        tag.decompose()
+    block_tags = {
+        "address", "article", "aside", "blockquote", "caption", "dd", "div", "dl",
+        "dt", "figcaption", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "li", "main", "ol", "p", "pre", "section", "table", "td", "th",
+        "tr", "ul",
+    }
+    for tag in list(soup.find_all(True)):
+        if tag.parent is None:
+            continue
+        if tag.name == "br":
+            tag.replace_with(NavigableString("\n"))
+        elif tag.name in block_tags:
+            tag.insert_before(NavigableString(" "))
+            tag.insert_after(NavigableString(" "))
+    return normalize(soup.get_text(separator=""))
+
+
+class ChandraBackend:
+    def __init__(self, args):
+        # Set before import: pydantic settings may read environment at module import.
+        if args.chandra_checkpoint:
+            os.environ["MODEL_CHECKPOINT"] = args.chandra_checkpoint
+        if args.backend == "chandra-vllm":
+            os.environ["VLLM_API_BASE"] = args.base_url
+            os.environ["VLLM_API_KEY"] = args.api_key
+            os.environ["VLLM_MODEL_NAME"] = args.model
+        from chandra.model import InferenceManager
+        from chandra.model.schema import BatchInputItem
+        self.BatchInputItem = BatchInputItem
+        self.manager = InferenceManager(method="hf" if args.backend == "chandra-hf" else "vllm")
+        self.args = args
+
+    def infer(self, path: Path) -> dict:
+        from PIL import Image
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+        item = self.BatchInputItem(image=image, prompt_type=self.args.chandra_prompt_type)
+        result = self.manager.generate([item], max_output_tokens=self.args.max_tokens,
+                                       include_headers_footers=True,
+                                       include_images=True)[0]
+        if result.error:
+            raise RuntimeError(f"Chandra reported an error: {result.error}")
+        html = result.html or ""
+        # Evaluate only visible text, not HTML tags/bboxes/Markdown markup.
+        prediction = chandra_html_to_text(html)
+        if not prediction and html.strip():
+            raise ValueError("Chandra HTML was nonempty but no text could be extracted")
+        return {
+            "prediction": prediction,
+            "raw": result.raw or "",
+            "html": html,
+            "markdown": result.markdown or "",
+            "finish_reason": "unknown",  # Chandra SDK does not expose finish_reason.
+            "tokens": getattr(result, "token_count", None),
+        }
+
+
+def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
+    ok = [r for r in rows if r.get("status") == "ok"]
+    errors = [r for r in rows if r.get("status") != "ok"]
+    chars = sum(r["char_count"] for r in ok)
+    words = sum(r["word_count"] for r in ok)
+    seconds = sum(r.get("seconds", 0) for r in ok)
+    return {
+        "expected_pages": expected_pages,
+        "pages_ok": len(ok),
+        "pages_failed": len(errors),
+        "pages_pending": max(0, expected_pages - len(ok) - len(errors)),
+        "cer": sum(r["char_edits"] for r in ok) / chars if chars else None,
+        "wer": sum(r["word_edits"] for r in ok) / words if words else None,
+        "mean_page_cer": sum(r["cer"] for r in ok) / len(ok) if ok else None,
+        "mean_page_wer": sum(r["wer"] for r in ok) / len(ok) if ok else None,
+        "total_seconds": round(seconds, 2),
+        "mean_seconds_per_page": round(seconds / len(ok), 2) if ok else None,
+    }
+
+
+def run(args):
+    manifest = Path(args.manifest).expanduser().resolve()
+    data = read_jsonl(manifest)
+    selected = [r for r in data if args.split == "all" or r["split"] == args.split]
+    if args.limit is not None:
+        selected = selected[:args.limit]
+    if not selected:
+        raise ValueError(f"No examples in split '{args.split}'")
+
+    if args.model is None:
+        args.model = "chandra" if args.backend == "chandra-vllm" else "Qwen/Qwen3.5-27B"
+    run_dir = Path(args.output).expanduser().resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config_path = run_dir / "run_config.json"
+    config = {
+        "schema_version": 1,
+        "manifest_sha256": digest_file(manifest),
+        "split": args.split,
+        "limit": args.limit,
+        "backend": args.backend,
+        "model": args.model if args.backend in ("openai", "chandra-vllm") else args.chandra_checkpoint or "datalab-to/chandra-ocr-2",
+        "base_url": args.base_url if args.backend != "chandra-hf" else None,
+        "max_tokens": args.max_tokens,
+        "chandra_prompt_type": args.chandra_prompt_type if args.backend.startswith("chandra") else None,
+        "allow_thinking": args.allow_thinking if args.backend == "openai" else None,
+        "prompt": PROMPT if args.backend == "openai" else "chandra SDK built-in prompt",
+    }
+    if config_path.exists():
+        old = json.loads(config_path.read_text(encoding="utf-8"))
+        if old != config:
+            raise ValueError(f"Run directory {run_dir} already belongs to a different configuration. Use another --output")
+    else:
+        write_json_atomic(config_path, config)
+
+    result_path = run_dir / "results.jsonl"
+    previous = read_jsonl(result_path) if result_path.exists() else []
+    completed = {str(r["task_id"]) for r in previous if r.get("status") == "ok"}
+    selected_ids = {str(r["task_id"]) for r in selected}
+    if any(r.get("status") == "ok" and str(r["task_id"]) not in selected_ids for r in previous):
+        raise ValueError("Existing run contains completed tasks outside the selected manifest subset")
+    if len(completed) == len(selected):
+        print(f"All {len(selected)} pages were already processed; refreshing summary")
+    else:
+        backend = OpenAIBackend(args) if args.backend == "openai" else ChandraBackend(args)
+        print(f"Backend={args.backend}; pages={len(selected)}; completed={len(completed)}; output={run_dir}")
+        # Add one record per finished page. Errors are recorded, but retried on resume.
+        with result_path.open("a", encoding="utf-8") as f:
+            for i, example in enumerate(selected, 1):
+                task_id = str(example["task_id"])
+                if task_id in completed:
+                    continue
+                path = Path(example["image"])
+                start = time.perf_counter()
+                outcome = {"task_id": task_id, "split": example["split"],
+                           "image": str(path), "gt": example["gt"], "timestamp": utc_now()}
+                try:
+                    if not path.is_file():
+                        raise FileNotFoundError(path)
+                    if args.check_images and digest_file(path) != example["image_sha256"]:
+                        raise RuntimeError("Image bytes changed after manifest generation")
+                    pred = backend.infer(path)
+                    outcome.update(pred)
+                    if pred.get("finish_reason") == "length":
+                        raise RuntimeError("Output was truncated (finish_reason=length); increase --max-tokens")
+                    outcome.update(score_page(example["gt"], pred["prediction"]))
+                    outcome["status"] = "ok"
+                    completed.add(task_id)
+                except KeyboardInterrupt:
+                    print("\nInterrupted. Resume with the same command.", file=sys.stderr)
+                    break
+                except Exception as exc:
+                    outcome["status"] = "error"
+                    outcome["error"] = f"{type(exc).__name__}: {exc}"
+                outcome["seconds"] = round(time.perf_counter() - start, 3)
+                f.write(stable_json(outcome) + "\n")
+                f.flush()
+                if args.fsync:
+                    os.fsync(f.fileno())
+                if outcome["status"] == "ok":
+                    print(f"[{i}/{len(selected)}] task={task_id} CER={outcome['cer']:.2%} "
+                          f"WER={outcome['wer']:.2%} {outcome['seconds']:.1f}s", flush=True)
+                else:
+                    print(f"[{i}/{len(selected)}] task={task_id} ERROR: {outcome['error']}", file=sys.stderr, flush=True)
+
+    # Latest attempt per task, so a failed attempt followed by success is counted once.
+    attempts = {str(r["task_id"]): r for r in read_jsonl(result_path)} if result_path.exists() else {}
+    latest = [attempts[k] for k in selected_ids if k in attempts]
+    summary = summarize_successes(latest, len(selected))
+    summary.update({"config": config, "created_at": utc_now()})
+    write_json_atomic(run_dir / "summary.json", summary)
+    print(f"OK={summary['pages_ok']}/{summary['expected_pages']}, errors={summary['pages_failed']}, "
+          f"CER={summary['cer']:.2%} WER={summary['wer']:.2%}" if summary["cer"] is not None
+          else f"OK=0/{summary['expected_pages']} (no successful predictions)")
+    print(f"Results: {run_dir / 'results.jsonl'}")
+    if summary["pages_failed"] or summary["pages_pending"]:
+        print("WARNING: incomplete run; quality metrics cover only successful pages!", file=sys.stderr)
+
+
+def compare(args):
+    runs = {}
+    for path_str in args.runs:
+        path = Path(path_str).expanduser().resolve()
+        cfg = json.loads((path / "run_config.json").read_text(encoding="utf-8"))
+        name = path.name
+        if name in runs:
+            raise ValueError(f"Duplicate run folder name: {name}")
+        latest = {str(r["task_id"]): r for r in read_jsonl(path / "results.jsonl")}
+        runs[name] = (cfg, latest)
+    configs = [c for c, _ in runs.values()]
+    if len({c["manifest_sha256"] for c in configs}) != 1:
+        raise ValueError("Runs were produced from different manifest versions; cannot compare")
+    common = set.intersection(*(set(r) for _, r in runs.values()))
+    common = {task_id for task_id in common if all(r[task_id].get("status") == "ok" for _, r in runs.values())}
+    if not common:
+        raise ValueError("There are no common successful documents across runs")
+    print(f"Same-document comparison: {len(common)} documents")
+    print(f"{'Run':<26} {'CER':>11} {'WER':>11} {'sec/page':>11}")
+    compare_rows = []
+    for name, (_, records) in runs.items():
+        sample = [records[k] for k in common]
+        summary = summarize_successes(sample, len(common))
+        print(f"{name:<26} {summary['cer']:>10.2%} {summary['wer']:>10.2%} "
+              f"{summary['mean_seconds_per_page']:>11.2f}")
+        for task_id in common:
+            r = records[task_id]
+            compare_rows.append({"task_id": task_id, "run": name, "image": r["image"],
+                                 "cer": r["cer"], "wer": r["wer"], "seconds": r["seconds"]})
+    if args.csv:
+        path = Path(args.csv).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["task_id", "run", "image", "cer", "wer", "seconds"])
+            writer.writeheader()
+            writer.writerows(sorted(compare_rows, key=lambda r: (r["task_id"], r["run"])))
+        print(f"Per-page comparison: {path}")
+
+
+def parser_factory():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("prepare", help="Convert Label Studio export to reproducible dev/test manifest")
+    p.add_argument("-d", "--dataset", required=True, help="Folder with annotations.json and page images")
+    p.add_argument("-o", "--output", default="target_manifest.jsonl")
+    p.add_argument("--dev-size", type=int, default=50)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--group-field", help="Path to page group in task JSON, e.g. data.document_id")
+    p.add_argument("--overwrite", action="store_true")
+    p.set_defaults(fn=prepare)
+
+    p = sub.add_parser("run", help="Run a single backend; resumable, one full page per request")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--split", choices=["dev", "test", "all"], default="dev")
+    p.add_argument("--backend", choices=["openai", "chandra-hf", "chandra-vllm"], required=True)
+    p.add_argument("--model", help="vLLM model name (defaults: Qwen/Qwen3.5-27B or chandra)")
+    p.add_argument("--chandra-checkpoint", help="Optional local model folder for chandra-hf")
+    p.add_argument("--chandra-prompt-type", choices=["ocr_layout", "ocr"], default="ocr_layout")
+    p.add_argument("--base-url", default="http://localhost:8000/v1")
+    p.add_argument("--api-key", default="EMPTY")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--limit", type=int, help="Process only first N examples (smoke test)")
+    p.add_argument("--max-tokens", type=int, default=12288)
+    p.add_argument("--timeout", type=float, default=600)
+    p.add_argument("--allow-thinking", action="store_true")
+    p.add_argument("--check-images", action="store_true", help="SHA256 verify images against manifest")
+    p.add_argument("--fsync", action="store_true", help="Durable write after every page (slower)")
+    p.set_defaults(fn=run)
+
+    p = sub.add_parser("compare", help="Compare CER/WER across runs on exactly common successful documents")
+    p.add_argument("runs", nargs="+", help="Run output folders")
+    p.add_argument("--csv", help="Optional per-page comparison file")
+    p.set_defaults(fn=compare)
+    return parser
+
+
+def main():
+    parser = parser_factory()
+    args = parser.parse_args()
+    if args.command == "prepare" and args.dev_size < 1:
+        parser.error("--dev-size must be positive")
+    if args.command == "run" and (args.max_tokens < 1 or (args.limit is not None and args.limit < 1)):
+        parser.error("--max-tokens and --limit must be positive")
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
