@@ -414,7 +414,7 @@ class ChandraBackend:
         self.repetition_detection_lock = Lock()
         self.args = args
 
-    def _request(self, item, temperature: float, top_p: float):
+    def _request(self, item, temperature: float, top_p: float, repetition_penalty: float):
         prompt_type = item.prompt_type or "ocr_layout"
         prompt = item.prompt or self.prompt_mapping[prompt_type]
         image = self.scale_to_fit(item.image)
@@ -425,7 +425,7 @@ class ChandraBackend:
         ]}]
 
         extra_body = {
-            "repetition_penalty": self.args.repetition_penalty,
+            "repetition_penalty": repetition_penalty,
             "frequency_penalty": self.args.frequency_penalty,
             "presence_penalty": self.args.presence_penalty,
         }
@@ -488,16 +488,21 @@ class ChandraBackend:
             "repetition_detection_enabled": self.repetition_detection_enabled,
         }
 
-    def _generate_one(self, item, repeat_retries: int) -> dict:
+    def _generate_one(self, item, repeat_retries: int, initial_penalty: float | None = None) -> dict:
         last_record = None
         initial_loop_detected = False
+        base_penalty = self.args.repetition_penalty if initial_penalty is None else initial_penalty
         for attempt in range(repeat_retries + 1):
             temperature = 0.0 if attempt == 0 else min(0.2 * attempt, 0.8)
             top_p = 0.1 if attempt == 0 else 0.95
+            repetition_penalty = min(
+                base_penalty + self.args.repetition_retry_step * attempt,
+                self.args.repetition_penalty_cap,
+            )
             completion = None
             for failure_attempt in range(self.args.max_failure_retries + 1):
                 try:
-                    completion = self._request(item, temperature, top_p)
+                    completion = self._request(item, temperature, top_p, repetition_penalty)
                     break
                 except Exception as exc:
                     if failure_attempt >= self.args.max_failure_retries:
@@ -509,6 +514,7 @@ class ChandraBackend:
                 return {"_error": f"{type(exc).__name__}: {exc}"}
             if attempt == 0:
                 initial_loop_detected = last_record["loop_detected"]
+            last_record["repetition_penalty_used"] = repetition_penalty
             last_record["initial_loop_detected"] = initial_loop_detected
             last_record["repeat_retries_used"] = attempt
             last_record["loop_recovered"] = initial_loop_detected and not last_record["loop_detected"]
@@ -516,11 +522,15 @@ class ChandraBackend:
                 return last_record
         return last_record or {"_error": "Chandra returned no completion"}
 
-    def _generate_items(self, items, max_workers: int, repeat_retries: int) -> list[dict]:
+    def _generate_items(
+        self, items, max_workers: int, repeat_retries: int, initial_penalty: float | None = None
+    ) -> list[dict]:
         if len(items) == 1:
-            return [self._generate_one(items[0], repeat_retries)]
+            return [self._generate_one(items[0], repeat_retries, initial_penalty)]
         with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
-            return list(pool.map(lambda item: self._generate_one(item, repeat_retries), items))
+            return list(pool.map(
+                lambda item: self._generate_one(item, repeat_retries, initial_penalty), items
+            ))
 
     def infer_many(self, paths: list[Path], max_workers: int) -> list[dict]:
         """Send a whole batch concurrently through vLLM's OpenAI-compatible API."""
@@ -569,7 +579,13 @@ class ChandraBackend:
                 for position in fallback_positions
             ]
             try:
-                fallback_results = self._generate_items(fallback_items, max_workers, repeat_retries=0)
+                fallback_penalty = min(
+                    self.args.repetition_penalty + self.args.repetition_retry_step,
+                    self.args.repetition_penalty_cap,
+                )
+                fallback_results = self._generate_items(
+                    fallback_items, max_workers, repeat_retries=0, initial_penalty=fallback_penalty
+                )
                 for position, fallback_result in zip(fallback_positions, fallback_results):
                     first = output[position]
                     try:
@@ -580,11 +596,13 @@ class ChandraBackend:
                             "initial_prediction": first.get("prediction", ""),
                             "initial_raw": first.get("raw", ""),
                             "initial_tokens": first.get("tokens"),
+                            "initial_repetition_penalty_used": first.get("repetition_penalty_used"),
                             "initial_loop_detected": first.get("initial_loop_detected",
                                                                 first.get("loop_detected", False)),
                             "initial_token_limit_reached": first.get("token_limit_reached", False),
                             "final_loop_detected": fallback.get("loop_detected", False),
                             "final_token_limit_reached": fallback.get("token_limit_reached", False),
+                            "final_repetition_penalty_used": fallback.get("repetition_penalty_used"),
                             "loop_detected": first.get("initial_loop_detected", first.get("loop_detected", False))
                                              or fallback.get("loop_detected", False),
                             "token_limit_reached": (first.get("token_limit_reached", False)
@@ -656,6 +674,8 @@ RUN_CONFIG_DEFAULTS = {
     "max_failure_retries": 2,
     "chandra_repeat_retries": 1,
     "repetition_penalty": 1.05,
+    "repetition_retry_step": 0.05,
+    "repetition_penalty_cap": 1.2,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
     "disable_repetition_detection": False,
@@ -737,8 +757,13 @@ def apply_run_config(args, parser):
         parser.error("repetition_min_count must be at least 2 and repetition_min_pattern_size at least 1")
     if values["repetition_max_pattern_size"] < values["repetition_min_pattern_size"]:
         parser.error("repetition_max_pattern_size must be >= repetition_min_pattern_size")
-    if not isinstance(values["repetition_penalty"], (int, float)) or values["repetition_penalty"] <= 0:
-        parser.error("repetition_penalty must be a positive number")
+    for key in ("repetition_penalty", "repetition_retry_step", "repetition_penalty_cap"):
+        if not isinstance(values[key], (int, float)) or isinstance(values[key], bool):
+            parser.error(f"{key} must be a number")
+    if values["repetition_penalty"] <= 0 or values["repetition_retry_step"] < 0:
+        parser.error("repetition_penalty must be positive and repetition_retry_step cannot be negative")
+    if values["repetition_penalty_cap"] < values["repetition_penalty"]:
+        parser.error("repetition_penalty_cap must be >= repetition_penalty")
     if not isinstance(values["frequency_penalty"], (int, float)) or not isinstance(values["presence_penalty"], (int, float)):
         parser.error("frequency_penalty and presence_penalty must be numbers")
     for key in ("disable_repetition_detection", "allow_thinking", "check_images", "fsync"):
@@ -778,6 +803,8 @@ def run(args):
         "chandra_fallback_repeat_retries": 0 if args.backend == "chandra-vllm" else None,
         "chandra_failure_retries": args.max_failure_retries if args.backend == "chandra-vllm" else None,
         "chandra_repetition_penalty": args.repetition_penalty if args.backend == "chandra-vllm" else None,
+        "chandra_repetition_retry_step": args.repetition_retry_step if args.backend == "chandra-vllm" else None,
+        "chandra_repetition_penalty_cap": args.repetition_penalty_cap if args.backend == "chandra-vllm" else None,
         "chandra_frequency_penalty": args.frequency_penalty if args.backend == "chandra-vllm" else None,
         "chandra_presence_penalty": args.presence_penalty if args.backend == "chandra-vllm" else None,
         "chandra_repetition_detection": ({
@@ -913,6 +940,8 @@ def run(args):
                             flags.append("loop-remains")
                         if outcome.get("token_limit_reached"):
                             flags.append("token-limit")
+                        if outcome.get("repetition_penalty_used") is not None:
+                            flags.append(f"penalty={outcome['repetition_penalty_used']:.2f}")
                         print(f"  task={outcome['task_id']} CER={outcome['cer']:.2%} "
                               f"WER={outcome['wer']:.2%} "
                               f"{' '.join(flags)}", flush=True)
@@ -976,6 +1005,9 @@ def compare(args):
                                  "initial_loop_detected": r.get("initial_loop_detected", False),
                                  "loop_recovered": r.get("loop_recovered", False),
                                  "repeat_retries_used": r.get("repeat_retries_used", 0),
+                                 "repetition_penalty_used": r.get("repetition_penalty_used"),
+                                 "initial_repetition_penalty_used": r.get("initial_repetition_penalty_used"),
+                                 "final_repetition_penalty_used": r.get("final_repetition_penalty_used"),
                                  "token_limit_reached": r.get("token_limit_reached", False),
                                  "loop_fallback_used": r.get("loop_fallback_used", False),
                                  "repetition_detection_enabled": r.get("repetition_detection_enabled")})
@@ -985,7 +1017,9 @@ def compare(args):
         with path.open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["task_id", "run", "image", "cer", "wer", "seconds",
                                                    "status", "loop_detected", "initial_loop_detected",
-                                                   "loop_recovered", "repeat_retries_used", "token_limit_reached",
+                                                   "loop_recovered", "repeat_retries_used",
+                                                   "repetition_penalty_used", "initial_repetition_penalty_used",
+                                                   "final_repetition_penalty_used", "token_limit_reached",
                                                    "loop_fallback_used", "repetition_detection_enabled"])
             writer.writeheader()
             writer.writerows(sorted(compare_rows, key=lambda r: (r["task_id"], r["run"])))
@@ -1019,6 +1053,10 @@ def parser_factory():
                    help="Chandra retries when it detects repeated output")
     p.add_argument("--repetition-penalty", type=float,
                    help="vLLM token repetition penalty for Chandra")
+    p.add_argument("--repetition-retry-step", type=float,
+                   help="Extra penalty added only when retrying a detected loop")
+    p.add_argument("--repetition-penalty-cap", type=float,
+                   help="Maximum penalty used for loop retries and OCR fallback")
     p.add_argument("--frequency-penalty", type=float,
                    help="vLLM frequency penalty for Chandra")
     p.add_argument("--presence-penalty", type=float,
