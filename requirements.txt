@@ -1,0 +1,14 @@
+# PyTorch wheels are provided locally on this machine.
+--find-links /home/mokin-a/wheels/
+
+# Direct project/runtime dependencies
+accelerate==1.15.0
+beautifulsoup4==4.15.0
+chandra-ocr==0.3.0
+openai==3.57.0
+Pillow==12.3.0
+RapidFuzz==3.14.5
+requests==2.32.3
+torch==2.14.1
+torchvision==0.29.2
+transformers==5.20.2
