@@ -55,12 +55,15 @@ python fullpage_ocr_benchmark.py compare \
   --csv runs/chandra-repetition-comparison.csv
 ```
 
+To check whether the n-gram detector is stopping too early on repeated layout tokens, run `configs/chandra-full-rp105-pattern3.json`. It changes only `repetition_min_pattern_size` from 1 to 3 and writes to a new output folder. For a penalty comparison with that detector setting held fixed, run `configs/chandra-full-rp100-pattern3.json` and compare those two output folders.
+
 Start Qwen's local vLLM server on both GPUs and port 8001, then run its config:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 vllm serve "$QWEN_MODEL_DIR" \
   --served-model-name Qwen/Qwen3.5-27B \
   --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.85 \
   --host 127.0.0.1 \
   --port 8001
 
