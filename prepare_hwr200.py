@@ -122,7 +122,8 @@ def convert(root: Path, modality_key: str, output: Path, source_filter: str = "a
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default="/home/arseniy/data/HWR200")
+    parser.add_argument("--root", required=True,
+                        help="Root of the full HWR200 copy (contains annotations/ and hw_dataset/)")
     parser.add_argument("--modality", choices=sorted(MODALITIES), required=True)
     parser.add_argument("--source", choices=["all", *SOURCES], default="all")
     parser.add_argument("--output", required=True)
