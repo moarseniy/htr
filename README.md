@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve "$QWEN_MODEL_DIR" \
 python fullpage_ocr_benchmark.py run --config configs/qwen-full.json
 ```
 
-Each JSON file contains the endpoint, batch size, retry policy, repetition controls, split, and output folder. `HTR_MANIFEST` selects the same validation manifest for each run. Change values in a JSON file when you want a different setup; the model checkpoint path is used by the separate vLLM server, while the `model` field here is the server's served name.
+Each JSON file contains the endpoint, batch size, retry policy, repetition controls, and output folder. `HTR_MANIFEST` selects the same validation manifest for each run; the runner evaluates every row in it. Change values in a JSON file when you want a different setup; the model checkpoint path is used by the separate vLLM server, while the `model` field here is the server's served name.
 
 For Chandra, the runner sends concurrent OpenAI-compatible requests to vLLM and uses Chandra's image scaling, prompt mapping, and output parsers. For the OpenAI-compatible backend, the client also submits concurrent requests so vLLM can use continuous batching. `--batch-size` controls client-side concurrency. Start with a modest value and increase it while monitoring GPU memory and server throughput.
 
@@ -77,15 +77,17 @@ Results are append-only and resumable. Successful task IDs are skipped on resume
 
 ## Prepare a manifest from Label Studio
 
+`prepare` converts the Label Studio export into a reproducible manifest containing every valid task ID, image path, human transcript and image hash. It does not divide the set into dev/test subsets.
+
 ```bash
-python download_label_studio.py --project-id PROJECT_ID --output data/label-studio
+python download_label_studio.py --project-id PROJECT_ID --output data/label-studio-validation --mode annotated
 python fullpage_ocr_benchmark.py prepare \
-  --dataset data/label-studio \
-  --output target_manifest.jsonl \
-  --dev-size 50
+  --dataset data/label-studio-validation \
+  --output data/validation_174.jsonl
+wc -l data/validation_174.jsonl
 ```
 
-If tasks contain a document identifier, pass it as `--group-field data.document_id` so pages from one document remain in the same split.
+Check the `prepare` summary and `wc -l`: both should show 174 valid rows. If they show 50, the Label Studio export folder contains only 50 tasks or the rest lack valid images/annotations; use the complete export before preparing again. Then set `HTR_MANIFEST` in `configs/local.env` to the absolute path of `data/validation_174.jsonl`.
 
 ## Compare runs
 

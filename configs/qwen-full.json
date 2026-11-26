@@ -4,7 +4,6 @@
   "base_url": "http://127.0.0.1:8001/v1",
   "api_key": "EMPTY",
   "manifest": "${HTR_MANIFEST}",
-  "split": "dev",
   "output": "../runs/qwen-full",
   "batch_size": 8,
   "max_tokens": 12288,

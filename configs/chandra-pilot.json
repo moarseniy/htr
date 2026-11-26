@@ -4,7 +4,6 @@
   "base_url": "http://127.0.0.1:8000/v1",
   "api_key": "EMPTY",
   "manifest": "${HTR_MANIFEST}",
-  "split": "dev",
   "limit": 8,
   "output": "../runs/chandra-pilot-rp105-adaptive",
   "batch_size": 8,

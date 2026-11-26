@@ -5,7 +5,7 @@ Backends: OpenAI-compatible vLLM (Qwen), Chandra OCR 2 vLLM.
 No line/word segmentation, no manual image enhancement or downsampling.
 
 Commands:
-  prepare  : Label Studio annotations.json -> immutable dev/test manifest
+  prepare  : Label Studio annotations.json -> immutable manifest of all valid labeled pages
   run      : OCR -> append-only result file; interrupted runs can be resumed
   compare  : compare separate model runs on overlapping tasks
 
@@ -22,7 +22,6 @@ import io
 import json
 import mimetypes
 import os
-import random
 import re
 import sys
 import time
@@ -221,37 +220,17 @@ def prepare(args):
             with Image.open(f) as image:
                 width, height = image.size
         sha = digest_file(img)
-        group = field(task, args.group_field) if args.group_field else None
-        # When no document ID is provided, exact duplicate images always stay together.
-        group_id = str(group) if group is not None and str(group).strip() else f"sha256:{sha}"
         rows.append({
             "task_id": tid,
             "image": str(img),
             "gt": gt,
             "image_sha256": sha,
-            "group_id": group_id,
             "width": width,
             "height": height,
         })
 
     if len(rows) < 2:
         raise ValueError("Fewer than 2 valid labeled images found")
-    # Connect all records sharing a group OR the same image, even across group IDs.
-    parent = list(range(len(rows)))
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-    def union(a, b):
-        parent[find(a)] = find(b)
-    by_group, by_sha = {}, {}
-    for i, r in enumerate(rows):
-        for cache, key in ((by_group, r["group_id"]), (by_sha, r["image_sha256"])):
-            if key in cache:
-                union(i, cache[key])
-            else:
-                cache[key] = i
     # Identical bytes must not have contradictory GT.
     gt_by_sha = defaultdict(set)
     for r in rows:
@@ -259,35 +238,14 @@ def prepare(args):
     conflicts = sum(len(texts) > 1 for texts in gt_by_sha.values())
     if conflicts:
         raise ValueError(f"{conflicts} duplicate image hashes have conflicting GT texts; please review annotations")
-    groups = defaultdict(list)
-    for i, row in enumerate(rows):
-        groups[find(i)].append(i)
-    keys = list(groups)
-    rng = random.Random(args.seed)
-    rng.shuffle(keys)
-    dev_keys = set()
-    dev_count = 0
-    for key in keys:
-        size = len(groups[key])
-        # Prevent ending with empty test split.
-        if dev_count < args.dev_size and len(dev_keys) < len(keys) - 1:
-            dev_keys.add(key)
-            dev_count += size
-    if not dev_keys:
-        raise ValueError("Could not produce dev split; check group field")
-    for key, indices in groups.items():
-        split = "dev" if key in dev_keys else "test"
-        for i in indices:
-            rows[i]["split"] = split
-    rows.sort(key=lambda row: (row["split"], row["task_id"]))
+    rows.sort(key=lambda row: row["task_id"])
     output = Path(args.output).expanduser().resolve()
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"{output} already exists; use --overwrite explicitly")
     write_jsonl_atomic(output, rows)
     print(f"Tasks in source: {len(tasks)}; valid GT/images: {len(rows)}; skipped: {dict(skipped)}")
     print(f"Manifest: {output}")
-    print(f"Dev: {sum(r['split'] == 'dev' for r in rows)}, test: {sum(r['split'] == 'test' for r in rows)}")
-    print("IMPORTANT: For multi-page documents, specify --group-field data.document_id if available.")
+    print(f"Validation pages: {len(rows)}")
 
 
 def image_as_data_url(path: Path) -> str:
@@ -667,7 +625,6 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
 RUN_CONFIG_DEFAULTS = {
     "backend": "chandra-vllm",
     "manifest": None,
-    "split": "dev",
     "model": None,
     "chandra_prompt_type": "ocr_layout",
     "batch_size": 8,
@@ -739,8 +696,6 @@ def apply_run_config(args, parser):
     valid_backends = {"openai", "chandra-vllm"}
     if values["backend"] not in valid_backends:
         parser.error(f"backend must be one of: {', '.join(sorted(valid_backends))}")
-    if values["split"] not in {"dev", "test", "all"}:
-        parser.error("split must be dev, test or all")
     for key in ("max_tokens", "batch_size", "repetition_min_count", "repetition_min_pattern_size",
                 "repetition_max_pattern_size"):
         if not isinstance(values[key], int) or isinstance(values[key], bool):
@@ -777,11 +732,11 @@ def apply_run_config(args, parser):
 def run(args):
     manifest = Path(args.manifest).expanduser().resolve()
     data = read_jsonl(manifest)
-    selected = [r for r in data if args.split == "all" or r["split"] == args.split]
+    selected = data
     if args.limit is not None:
         selected = selected[:args.limit]
     if not selected:
-        raise ValueError(f"No examples in split '{args.split}'")
+        raise ValueError("Manifest contains no labeled pages")
 
     if args.model is None:
         args.model = "chandra" if args.backend == "chandra-vllm" else "Qwen/Qwen3.5-27B"
@@ -791,7 +746,6 @@ def run(args):
     config = {
         "schema_version": 3,
         "manifest_sha256": digest_file(manifest),
-        "split": args.split,
         "limit": args.limit,
         "backend": args.backend,
         "model": args.model,
@@ -881,7 +835,6 @@ def run(args):
                     path = Path(example["image"])
                     outcome = {
                         "task_id": str(example["task_id"]),
-                        "split": example["split"],
                         "image": str(path),
                         "gt": example["gt"],
                         "timestamp": utc_now(),
@@ -1029,19 +982,15 @@ def compare(args):
 def parser_factory():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("prepare", help="Convert Label Studio export to reproducible dev/test manifest")
+    p = sub.add_parser("prepare", help="Build the validation manifest from all valid Label Studio tasks")
     p.add_argument("-d", "--dataset", required=True, help="Folder with annotations.json and page images")
     p.add_argument("-o", "--output", default="target_manifest.jsonl")
-    p.add_argument("--dev-size", type=int, default=50)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--group-field", help="Path to page group in task JSON, e.g. data.document_id")
     p.add_argument("--overwrite", action="store_true")
     p.set_defaults(fn=prepare)
 
     p = sub.add_parser("run", help="Run a vLLM backend in resumable batches")
     p.add_argument("--config", help="JSON run config; explicit CLI options can override its values")
     p.add_argument("--manifest")
-    p.add_argument("--split", choices=["dev", "test", "all"])
     p.add_argument("--backend", choices=["openai", "chandra-vllm"],
                    help="OpenAI-compatible vLLM for Qwen, or Chandra's vLLM client")
     p.add_argument("--model", help="vLLM model name (defaults: Qwen/Qwen3.5-27B or chandra)")
@@ -1091,8 +1040,6 @@ def parser_factory():
 def main():
     parser = parser_factory()
     args = parser.parse_args()
-    if args.command == "prepare" and args.dev_size < 1:
-        parser.error("--dev-size must be positive")
     if args.command == "run":
         apply_run_config(args, parser)
     args.fn(args)
