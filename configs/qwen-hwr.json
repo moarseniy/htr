@@ -1,0 +1,14 @@
+{
+  "backend": "openai",
+  "model": "Qwen/Qwen3.5-27B",
+  "base_url": "http://127.0.0.1:8001/v1",
+  "api_key": "EMPTY",
+  "manifest": "${HTR_MANIFEST}",
+  "output": "${HTR_OUTPUT}",
+  "batch_size": 8,
+  "max_tokens": 12288,
+  "timeout": 600,
+  "allow_thinking": false,
+  "check_images": true,
+  "fsync": false
+}

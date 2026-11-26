@@ -119,6 +119,39 @@ python fullpage_ocr_benchmark.py compare \
 
 After selecting a configuration on validation, use the corresponding `*-test.json` configs for the held-out test split.
 
+## HWR200
+
+HWR200 JSON annotations contain a transcript for the whole document, while each `hw_dataset/<id>/<item>/...` folder contains its pages. `prepare_hwr200.py` therefore creates document-level manifest rows with an ordered list of page images. It creates one manifest per acquisition mode so scans, light photos, and dark photos are scored separately instead of counting the same text three times.
+
+The current local fragment has 300 annotation/image pairs per modality: 20 FPR, 20 Originals, and 260 Reuse documents. Each manifest contains 1,091 page images across those documents.
+
+```bash
+python prepare_hwr200.py --root /home/arseniy/data/HWR200 --modality scans \
+  --output data/open_manifests/hwr200_scans.jsonl
+python prepare_hwr200.py --root /home/arseniy/data/HWR200 --modality light \
+  --output data/open_manifests/hwr200_light.jsonl
+python prepare_hwr200.py --root /home/arseniy/data/HWR200 --modality dark \
+  --output data/open_manifests/hwr200_dark.jsonl
+```
+
+Example: run both models on the scans modality. The runner OCRs each document's pages in filename order, joins their outputs, and scores against that document's `full_text`.
+
+```bash
+HTR_MANIFEST="$PWD/data/open_manifests/hwr200_scans.jsonl" \
+HTR_OUTPUT="$PWD/runs/hwr200-scans-chandra" \
+python fullpage_ocr_benchmark.py run --config configs/chandra-hwr.json
+
+HTR_MANIFEST="$PWD/data/open_manifests/hwr200_scans.jsonl" \
+HTR_OUTPUT="$PWD/runs/hwr200-scans-qwen" \
+python fullpage_ocr_benchmark.py run --config configs/qwen-hwr.json
+
+python fullpage_ocr_benchmark.py compare \
+  runs/hwr200-scans-chandra runs/hwr200-scans-qwen \
+  --csv runs/hwr200-scans-comparison.csv
+```
+
+Repeat with `hwr200_light.jsonl` and `hwr200_dark.jsonl` to compare the photo conditions.
+
 ## Compare runs
 
 ```bash

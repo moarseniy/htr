@@ -588,6 +588,7 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
     scored = [r for r in rows if "char_count" in r and "word_count" in r]
     chars = sum(r["char_count"] for r in scored)
     words = sum(r["word_count"] for r in scored)
+    images_scored = sum(int(r.get("input_image_count", 1)) for r in scored)
     # Batched rows repeat the batch wall time; count it once per batch.
     batch_seconds = {}
     legacy_seconds = 0.0
@@ -603,11 +604,17 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
     fallback_pages = sum(bool(r.get("loop_fallback_used")) for r in scored)
     token_limited = sum(bool(r.get("token_limit_reached")) for r in scored)
     return {
+        "expected_samples": expected_pages,
+        "samples_ok": len(ok),
+        "samples_failed": len(errors),
+        "samples_scored": len(scored),
+        "samples_pending": max(0, expected_pages - len(scored)),
         "expected_pages": expected_pages,
         "pages_ok": len(ok),
         "pages_failed": len(errors),
         "pages_scored": len(scored),
         "pages_pending": max(0, expected_pages - len(scored)),
+        "images_scored": images_scored,
         "pages_with_initial_loop": initial_loops,
         "pages_with_final_loop": final_loops,
         "pages_using_ocr_fallback": fallback_pages,
@@ -616,9 +623,14 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
         "wer": sum(r["word_edits"] for r in scored) / words if words else None,
         "mean_page_cer": sum(r["cer"] for r in scored) / len(scored) if scored else None,
         "mean_page_wer": sum(r["wer"] for r in scored) / len(scored) if scored else None,
+        "mean_sample_cer": sum(r["cer"] for r in scored) / len(scored) if scored else None,
+        "mean_sample_wer": sum(r["wer"] for r in scored) / len(scored) if scored else None,
         "total_seconds": round(seconds, 2),
-        "mean_seconds_per_page": round(seconds / len(scored), 2) if scored else None,
-        "pages_per_second": round(len(scored) / seconds, 4) if seconds else None,
+        "mean_seconds_per_page": round(seconds / images_scored, 2) if images_scored else None,
+        "pages_per_second": round(images_scored / seconds, 4) if seconds else None,
+        "images_per_second": round(images_scored / seconds, 4) if seconds else None,
+        "mean_seconds_per_sample": round(seconds / len(scored), 2) if scored else None,
+        "samples_per_second": round(len(scored) / seconds, 4) if seconds else None,
     }
 
 
@@ -771,7 +783,7 @@ def run(args):
         "chandra_loop_policy": "penalty, n-gram early stop, bounded retries, OCR fallback; score final output" if args.backend == "chandra-vllm" else None,
         "allow_thinking": args.allow_thinking if args.backend == "openai" else None,
         "prompt": PROMPT if args.backend == "openai" else "chandra SDK built-in prompt",
-        "timing": "batch wall time; seconds per page is amortized throughput time",
+        "timing": "batch wall time; seconds per page and sample are amortized throughput times",
     }
     if config_path.exists():
         old = json.loads(config_path.read_text(encoding="utf-8"))
@@ -802,74 +814,161 @@ def run(args):
             for batch_number, batch in enumerate(batches, 1):
                 batch_id = f"{time.time_ns()}-{batch_number}"
                 started = time.perf_counter()
-                valid_indices, paths = [], []
-                errors = {}
-                for index, example in enumerate(batch):
-                    path = Path(example["image"])
-                    try:
-                        if not path.is_file():
-                            raise FileNotFoundError(path)
-                        if args.check_images and digest_file(path) != example["image_sha256"]:
-                            raise RuntimeError("Image bytes changed after manifest generation")
-                        valid_indices.append(index)
-                        paths.append(path)
-                    except Exception as exc:
-                        errors[index] = f"{type(exc).__name__}: {exc}"
+                page_states, jobs = [], []
+                for sample_index, example in enumerate(batch):
+                    refs = example.get("images")
+                    if not isinstance(refs, list) or not refs:
+                        refs = [example.get("image")]
+                    expected_hashes = example.get("image_sha256s")
+                    states = []
+                    for page_index, image_ref in enumerate(refs):
+                        state = {"image": image_ref, "result": None, "error": None}
+                        try:
+                            if not isinstance(image_ref, str) or not image_ref:
+                                raise ValueError("image reference is missing")
+                            path = Path(image_ref)
+                            if not path.is_file():
+                                raise FileNotFoundError(path)
+                            if args.check_images:
+                                expected_hash = None
+                                if isinstance(expected_hashes, list) and page_index < len(expected_hashes):
+                                    expected_hash = expected_hashes[page_index]
+                                elif page_index == 0:
+                                    expected_hash = example.get("image_sha256")
+                                if expected_hash and digest_file(path) != expected_hash:
+                                    raise RuntimeError(f"Image bytes changed after manifest generation: {path}")
+                            jobs.append((sample_index, page_index, path))
+                        except Exception as exc:
+                            state["error"] = f"{type(exc).__name__}: {exc}"
+                        states.append(state)
+                    page_states.append(states)
 
                 predictions = []
-                if paths:
+                if jobs:
                     try:
-                        predictions = backend.infer_many(paths, max_workers=args.batch_size)
+                        predictions = backend.infer_many(
+                            [job[2] for job in jobs], max_workers=args.batch_size
+                        )
                     except KeyboardInterrupt:
                         print("\nInterrupted during a batch. Resume with the same command.", file=sys.stderr)
                         break
                     except Exception as exc:
                         message = f"{type(exc).__name__}: {exc}"
-                        predictions = [{"_error": message} for _ in paths]
+                        predictions = [{"_error": message} for _ in jobs]
+                for (sample_index, page_index, _path), prediction in zip(jobs, predictions):
+                    page_states[sample_index][page_index]["result"] = prediction
                 elapsed = time.perf_counter() - started
-                per_page_seconds = elapsed / len(batch)
-                prediction_by_index = dict(zip(valid_indices, predictions))
+                per_sample_seconds = elapsed / len(batch)
+                page_count = sum(len(states) for states in page_states)
                 records = []
 
-                for index, example in enumerate(batch):
-                    path = Path(example["image"])
+                for sample_index, example in enumerate(batch):
+                    states = page_states[sample_index]
+                    image_paths = [state["image"] for state in states if state["image"]]
                     outcome = {
                         "task_id": str(example["task_id"]),
-                        "image": str(path),
+                        "image": image_paths[0] if image_paths else str(example.get("image", "")),
                         "gt": example["gt"],
                         "timestamp": utc_now(),
                         "batch_id": batch_id,
                         "batch_size": len(batch),
+                        "input_image_count": len(states),
                         "batch_seconds": round(elapsed, 3),
-                        "seconds": round(per_page_seconds, 3),
+                        "seconds": round(per_sample_seconds, 3),
                     }
+                    if len(states) > 1 or isinstance(example.get("images"), list):
+                        outcome["images"] = image_paths
                     for metadata_key in ("source_dataset", "source_split", "reading_order",
+                                         "source_class", "image_variant", "page_count",
                                          "text_annotation_count"):
                         if metadata_key in example:
                             outcome[metadata_key] = example[metadata_key]
+                    page_texts, page_metadata, errors = [], [], []
+                    page_records = []
+                    for state in states:
+                        pred = state.get("result")
+                        error = state.get("error")
+                        if not error and pred is None:
+                            error = "Backend returned no prediction for this image"
+                        if not error and pred.get("_error"):
+                            error = pred["_error"]
+                        page_texts.append("" if error else pred.get("prediction", ""))
+                        if error:
+                            errors.append(f"{state['image']}: {error}")
+                        if pred and not pred.get("_error"):
+                            page_records.append(pred)
+                        page_metadata.append({
+                            "image": state["image"],
+                            "error": error,
+                            "tokens": pred.get("tokens") if pred and not pred.get("_error") else None,
+                            "finish_reason": pred.get("finish_reason") if pred and not pred.get("_error") else None,
+                            "loop_detected": bool(pred.get("loop_detected")) if pred and not pred.get("_error") else False,
+                            "initial_loop_detected": bool(pred.get("initial_loop_detected")) if pred and not pred.get("_error") else False,
+                            "loop_recovered": bool(pred.get("loop_recovered")) if pred and not pred.get("_error") else False,
+                            "loop_fallback_used": bool(pred.get("loop_fallback_used")) if pred and not pred.get("_error") else False,
+                            "loop_fallback_prompt_type": pred.get("loop_fallback_prompt_type") if pred and not pred.get("_error") else None,
+                            "loop_fallback_error": pred.get("loop_fallback_error") if pred and not pred.get("_error") else None,
+                            "token_limit_reached": bool(pred.get("token_limit_reached")) if pred and not pred.get("_error") else False,
+                            "repetition_penalty_used": pred.get("repetition_penalty_used") if pred and not pred.get("_error") else None,
+                            "initial_repetition_penalty_used": pred.get("initial_repetition_penalty_used") if pred and not pred.get("_error") else None,
+                            "final_repetition_penalty_used": pred.get("final_repetition_penalty_used") if pred and not pred.get("_error") else None,
+                            "repeat_retries_used": pred.get("repeat_retries_used", 0) if pred and not pred.get("_error") else 0,
+                            "initial_prediction": pred.get("initial_prediction") if pred and not pred.get("_error") else None,
+                            "repetition_detection_enabled": pred.get("repetition_detection_enabled") if pred and not pred.get("_error") else None,
+                        })
+
+                    outcome["prediction"] = "\n".join(page_texts)
+                    outcome["tokens"] = sum(
+                        int(r["tokens"]) for r in page_records if isinstance(r.get("tokens"), (int, float))
+                    )
+                    outcome["token_limit_reached"] = any(r.get("token_limit_reached") for r in page_records)
+                    outcome["loop_detected"] = any(r.get("loop_detected") for r in page_records)
+                    outcome["initial_loop_detected"] = any(
+                        r.get("initial_loop_detected", r.get("loop_detected", False)) for r in page_records
+                    )
+                    outcome["final_loop_detected"] = any(
+                        r.get("final_loop_detected", r.get("loop_detected", False)) for r in page_records
+                    )
+                    outcome["loop_recovered"] = any(r.get("loop_recovered") for r in page_records)
+                    outcome["loop_fallback_used"] = any(r.get("loop_fallback_used") for r in page_records)
+                    outcome["repeat_retries_used"] = sum(r.get("repeat_retries_used", 0) for r in page_records)
+                    detection_values = [r.get("repetition_detection_enabled") for r in page_records
+                                        if r.get("repetition_detection_enabled") is not None]
+                    if detection_values:
+                        outcome["repetition_detection_enabled"] = all(detection_values)
+                    penalties = [r.get("repetition_penalty_used") for r in page_records
+                                 if r.get("repetition_penalty_used") is not None]
+                    if penalties:
+                        outcome["repetition_penalty_used"] = penalties[0] if len(set(penalties)) == 1 else penalties
+                    for field in ("initial_repetition_penalty_used", "final_repetition_penalty_used"):
+                        values = [r.get(field) for r in page_records if r.get(field) is not None]
+                        if values:
+                            outcome[field] = values[0] if len(set(values)) == 1 else values
+                    for output_key in ("raw", "html", "markdown"):
+                        parts = [r.get(output_key, "") for r in page_records if r.get(output_key)]
+                        if parts:
+                            outcome[output_key] = "\n".join(parts)
+                    if len(states) == 1 and page_records:
+                        for key, value in page_records[0].items():
+                            if key not in {"prediction", "raw", "html", "markdown"}:
+                                outcome[key] = value
+                    if len(states) > 1 or isinstance(example.get("images"), list):
+                        outcome["page_results"] = page_metadata
+
                     try:
-                        if index in errors:
-                            raise RuntimeError(errors[index])
-                        pred = prediction_by_index.get(index)
-                        if pred is None:
-                            raise RuntimeError("Backend returned no prediction for this page")
-                        outcome.update({k: v for k, v in pred.items() if k != "_error"})
-                        if pred.get("_error"):
-                            outcome["inference_error"] = pred["_error"]
-                            raise RuntimeError(pred["_error"])
-                        if pred.get("finish_reason") == "length":
-                            outcome["token_limit_reached"] = True
-                        outcome.update(score_page(example["gt"], pred["prediction"]))
-                        outcome["status"] = "ok"
-                        completed.add(str(example["task_id"]))
+                        outcome.update(score_page(example["gt"], outcome["prediction"]))
+                        if errors:
+                            outcome["status"] = "error"
+                            outcome["error"] = "; ".join(errors)
+                            outcome["retryable"] = True
+                        else:
+                            outcome["status"] = "ok"
+                            completed.add(str(example["task_id"]))
                     except Exception as exc:
                         outcome["status"] = "error"
                         outcome["error"] = f"{type(exc).__name__}: {exc}"
                         outcome["retryable"] = True
-                        # Keep every labeled page in the metric denominator. If inference
-                        # returned no text, score it as an empty transcription (all deletions).
                         if "char_count" not in outcome:
-                            outcome["prediction"] = outcome.get("prediction", "")
                             try:
                                 outcome.update(score_page(example["gt"], outcome["prediction"]))
                             except Exception as metric_exc:
@@ -883,9 +982,9 @@ def run(args):
                         os.fsync(f.fileno())
                 ok_records = [r for r in records if r["status"] == "ok"]
                 errors_count = len(records) - len(ok_records)
-                print(f"[batch {batch_number}/{len(batches)}] pages={len(batch)} "
+                print(f"[batch {batch_number}/{len(batches)}] samples={len(batch)} images={page_count} "
                       f"ok={len(ok_records)} errors={errors_count} wall={elapsed:.1f}s "
-                      f"throughput={len(batch) / elapsed:.3f} pages/s", flush=True)
+                      f"throughput={len(batch) / elapsed:.3f} samples/s", flush=True)
                 for outcome in records:
                     if outcome["status"] == "ok":
                         flags = []
@@ -912,10 +1011,12 @@ def run(args):
     summary = summarize_successes(latest, len(selected))
     summary.update({"config": config, "created_at": utc_now()})
     write_json_atomic(run_dir / "summary.json", summary)
-    print(f"OK={summary['pages_ok']}/{summary['expected_pages']}, scored={summary['pages_scored']}, "
+    print(f"OK samples={summary['samples_ok']}/{summary['expected_samples']}, "
+          f"scored={summary['samples_scored']}, "
+          f"images={summary['images_scored']}, "
           f"errors={summary['pages_failed']}, "
           f"CER={summary['cer']:.2%} WER={summary['wer']:.2%}" if summary["cer"] is not None
-          else f"OK=0/{summary['expected_pages']} (no successful predictions)")
+          else f"OK=0/{summary['expected_samples']} (no successful predictions)")
     print(f"Results: {run_dir / 'results.jsonl'}")
     print(f"Loops initial/final: {summary['pages_with_initial_loop']}/"
           f"{summary['pages_with_final_loop']}; OCR fallbacks: {summary['pages_using_ocr_fallback']}; "
@@ -958,6 +1059,11 @@ def compare(args):
             compare_rows.append({"task_id": task_id, "run": name, "image": r["image"],
                                  "cer": r["cer"], "wer": r["wer"], "seconds": r["seconds"],
                                  "status": r["status"],
+                                 "source_dataset": r.get("source_dataset"),
+                                 "source_split": r.get("source_split"),
+                                 "source_class": r.get("source_class"),
+                                 "image_variant": r.get("image_variant"),
+                                 "input_image_count": r.get("input_image_count", 1),
                                  "loop_detected": r.get("loop_detected", False),
                                  "initial_loop_detected": r.get("initial_loop_detected", False),
                                  "loop_recovered": r.get("loop_recovered", False),
@@ -973,7 +1079,9 @@ def compare(args):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["task_id", "run", "image", "cer", "wer", "seconds",
-                                                   "status", "loop_detected", "initial_loop_detected",
+                                                   "status", "source_dataset", "source_split", "source_class",
+                                                   "image_variant", "input_image_count",
+                                                   "loop_detected", "initial_loop_detected",
                                                    "loop_recovered", "repeat_retries_used",
                                                    "repetition_penalty_used", "initial_repetition_penalty_used",
                                                    "final_repetition_penalty_used", "token_limit_reached",
