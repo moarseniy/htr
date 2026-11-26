@@ -843,6 +843,10 @@ def run(args):
                         "batch_seconds": round(elapsed, 3),
                         "seconds": round(per_page_seconds, 3),
                     }
+                    for metadata_key in ("source_dataset", "source_split", "reading_order",
+                                         "text_annotation_count"):
+                        if metadata_key in example:
+                            outcome[metadata_key] = example[metadata_key]
                     try:
                         if index in errors:
                             raise RuntimeError(errors[index])

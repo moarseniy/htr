@@ -92,6 +92,33 @@ wc -l data/validation_174.jsonl
 
 Check the `prepare` summary and `wc -l`: both should show 174 valid rows. If they show 50, the Label Studio export folder contains only 50 tasks or the rest lack valid images/annotations; use the complete export before preparing again. Then set `HTR_MANIFEST` in `configs/local.env` to the absolute path of `data/validation_174.jsonl`.
 
+## School Notebooks RU
+
+The local COCO export has official `train`, `val`, and `test` files. This converter builds page-level transcripts from text-bearing categories (`pupil_text`, `pupil_comment`, `teacher_comment`), ordering words by annotated line geometry. It creates separate manifests for the official validation and test splits; training pages are not included in evaluation.
+
+```bash
+python prepare_school_notebooks.py \
+  --root /home/arseniy/data/school_notebooks_RU \
+  --split val \
+  --output data/open_manifests/school_notebooks_val.jsonl
+python prepare_school_notebooks.py \
+  --root /home/arseniy/data/school_notebooks_RU \
+  --split test \
+  --output data/open_manifests/school_notebooks_test.jsonl
+```
+
+Run both OCR models on the same official validation split, then compare:
+
+```bash
+python fullpage_ocr_benchmark.py run --config configs/chandra-school-val.json
+python fullpage_ocr_benchmark.py run --config configs/qwen-school-val.json
+python fullpage_ocr_benchmark.py compare \
+  runs/school-notebooks-val-chandra-pattern3 runs/school-notebooks-val-qwen \
+  --csv runs/school-notebooks-val-comparison.csv
+```
+
+After selecting a configuration on validation, use the corresponding `*-test.json` configs for the held-out test split.
+
 ## Compare runs
 
 ```bash
