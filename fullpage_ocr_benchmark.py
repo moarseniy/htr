@@ -275,34 +275,123 @@ PROMPT = (
 class OpenAIBackend:
     def __init__(self, args):
         from openai import OpenAI
+        from chandra.model.util import detect_repeat_token
         self.args = args
         self.client = OpenAI(base_url=args.base_url, api_key=args.api_key,
                              timeout=args.timeout, max_retries=0)
+        self.detect_repeat_token = detect_repeat_token
+        self.repetition_detection_enabled = not args.disable_repetition_detection
+        self.repetition_detection_lock = Lock()
 
-    def infer(self, path: Path) -> dict:
-        kwargs = {}
+    def _request(self, path: Path, temperature: float, repetition_penalty: float):
+        extra_body = {
+            "repetition_penalty": repetition_penalty,
+            "frequency_penalty": self.args.frequency_penalty,
+            "presence_penalty": self.args.presence_penalty,
+        }
         if not self.args.allow_thinking and "qwen" in self.args.model.lower():
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-        reply = self.client.chat.completions.create(
-            model=self.args.model,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": PROMPT},
-                {"type": "image_url", "image_url": {"url": image_as_data_url(path)}},
-            ]}],
-            temperature=0,
-            max_tokens=self.args.max_tokens,
-            **kwargs,
-        )
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        if self.repetition_detection_enabled:
+            extra_body["repetition_detection"] = {
+                "max_pattern_size": self.args.repetition_max_pattern_size,
+                "min_pattern_size": self.args.repetition_min_pattern_size,
+                "min_count": self.args.repetition_min_count,
+            }
+
+        def create(body):
+            return self.client.chat.completions.create(
+                model=self.args.model,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_as_data_url(path)}},
+                ]}],
+                temperature=temperature,
+                max_tokens=self.args.max_tokens,
+                extra_body=body,
+            )
+
+        try:
+            return create(extra_body)
+        except Exception as exc:
+            if self.repetition_detection_enabled and "repetition_detection" in str(exc).lower():
+                with self.repetition_detection_lock:
+                    self.repetition_detection_enabled = False
+                extra_body.pop("repetition_detection", None)
+                return create(extra_body)
+            raise
+
+    def _to_record(self, reply) -> dict:
         choice = reply.choices[0]
         text = choice.message.content or ""
         if isinstance(text, list):
             text = "\n".join(str(x.get("text", "")) for x in text if isinstance(x, dict))
+        text = str(text)
+        finish_reason = choice.finish_reason
+        usage = getattr(reply, "usage", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        repeated = (
+            finish_reason == "repetition"
+            or self.detect_repeat_token(text)
+            or (len(text) > 50 and self.detect_repeat_token(text, cut_from_end=50))
+        )
         return {
-            "prediction": str(text),
-            "raw": str(text),
-            "finish_reason": choice.finish_reason,
-            "tokens": getattr(getattr(reply, "usage", None), "total_tokens", None),
+            "prediction": text,
+            "raw": text,
+            "finish_reason": finish_reason,
+            "tokens": completion_tokens,
+            "completion_tokens": completion_tokens,
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "loop_detected": bool(repeated),
+            "token_limit_reached": finish_reason == "length" or (
+                isinstance(completion_tokens, (int, float)) and completion_tokens >= self.args.max_tokens
+            ),
+            "repetition_detection_enabled": self.repetition_detection_enabled,
         }
+
+    def infer(self, path: Path) -> dict:
+        last_record = None
+        initial_loop = False
+        initial_token_limit = False
+        for attempt in range(self.args.qwen_repeat_retries + 1):
+            penalty = min(
+                self.args.repetition_penalty + self.args.repetition_retry_step * attempt,
+                self.args.repetition_penalty_cap,
+            )
+            temperature = 0.0 if attempt == 0 else min(0.2 * attempt, 0.8)
+            reply = None
+            for failure_attempt in range(self.args.max_failure_retries + 1):
+                try:
+                    reply = self._request(path, temperature, penalty)
+                    break
+                except Exception as exc:
+                    if failure_attempt >= self.args.max_failure_retries:
+                        return {"_error": f"{type(exc).__name__}: {exc}"}
+                    time.sleep(2 * (failure_attempt + 1))
+            try:
+                last_record = self._to_record(reply)
+            except Exception as exc:
+                return {"_error": f"{type(exc).__name__}: {exc}"}
+            if attempt == 0:
+                initial_loop = last_record["loop_detected"]
+                initial_token_limit = last_record["token_limit_reached"]
+                last_record["initial_prediction"] = last_record["prediction"]
+                last_record["initial_raw"] = last_record["raw"]
+                last_record["initial_tokens"] = last_record["tokens"]
+                last_record["initial_repetition_penalty_used"] = penalty
+            last_record["repetition_penalty_used"] = penalty
+            last_record["repeat_retries_used"] = attempt
+            last_record["initial_loop_detected"] = initial_loop
+            last_record["initial_token_limit_reached"] = initial_token_limit
+            last_record["final_loop_detected"] = last_record["loop_detected"]
+            last_record["final_token_limit_reached"] = last_record["token_limit_reached"]
+            last_record["loop_recovered"] = initial_loop and not last_record["loop_detected"]
+            if not (last_record["loop_detected"] or last_record["token_limit_reached"]):
+                return last_record
+            if attempt >= self.args.qwen_repeat_retries:
+                return last_record
+        return last_record or {"_error": "Qwen vLLM returned no completion"}
 
     def infer_many(self, paths: list[Path], max_workers: int) -> list[dict]:
         """Send requests concurrently so vLLM can continuously batch them."""
@@ -602,7 +691,10 @@ def summarize_successes(rows: list[dict], expected_pages: int) -> dict:
     initial_loops = sum(bool(r.get("initial_loop_detected", r.get("loop_detected", False))) for r in scored)
     final_loops = sum(bool(r.get("final_loop_detected", r.get("loop_detected", False))) for r in scored)
     fallback_pages = sum(bool(r.get("loop_fallback_used")) for r in scored)
-    token_limited = sum(bool(r.get("token_limit_reached")) for r in scored)
+    token_limited = sum(
+        bool(r.get("token_limit_reached")) or r.get("finish_reason") == "length"
+        for r in scored
+    )
     return {
         "expected_samples": expected_pages,
         "samples_ok": len(ok),
@@ -642,13 +734,14 @@ RUN_CONFIG_DEFAULTS = {
     "batch_size": 8,
     "max_failure_retries": 2,
     "chandra_repeat_retries": 1,
-    "repetition_penalty": 1.05,
+    "qwen_repeat_retries": 0,
+    "repetition_penalty": 1.0,
     "repetition_retry_step": 0.05,
     "repetition_penalty_cap": 1.2,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
-    "disable_repetition_detection": False,
-    "repetition_min_pattern_size": 1,
+    "disable_repetition_detection": True,
+    "repetition_min_pattern_size": 3,
     "repetition_max_pattern_size": 5,
     "repetition_min_count": 8,
     "base_url": "http://localhost:8000/v1",
@@ -712,7 +805,7 @@ def apply_run_config(args, parser):
                 "repetition_max_pattern_size"):
         if not isinstance(values[key], int) or isinstance(values[key], bool):
             parser.error(f"{key} must be an integer")
-    for key in ("max_failure_retries", "chandra_repeat_retries"):
+    for key in ("max_failure_retries", "chandra_repeat_retries", "qwen_repeat_retries"):
         if not isinstance(values[key], int) or isinstance(values[key], bool) or values[key] < 0:
             parser.error(f"{key} must be a non-negative integer")
     if values["limit"] is not None and (
@@ -756,7 +849,7 @@ def run(args):
     run_dir.mkdir(parents=True, exist_ok=True)
     config_path = run_dir / "run_config.json"
     config = {
-        "schema_version": 3,
+        "schema_version": 4,
         "manifest_sha256": digest_file(manifest),
         "limit": args.limit,
         "backend": args.backend,
@@ -766,9 +859,11 @@ def run(args):
         "batch_size": args.batch_size,
         "chandra_prompt_type": args.chandra_prompt_type if args.backend == "chandra-vllm" else None,
         "chandra_repeat_retries": args.chandra_repeat_retries if args.backend == "chandra-vllm" else None,
+        "qwen_repeat_retries": args.qwen_repeat_retries if args.backend == "openai" else None,
         "chandra_fallback_repeat_retries": 0 if args.backend == "chandra-vllm" else None,
         "chandra_failure_retries": args.max_failure_retries if args.backend == "chandra-vllm" else None,
         "chandra_repetition_penalty": args.repetition_penalty if args.backend == "chandra-vllm" else None,
+        "vllm_repetition_penalty": args.repetition_penalty if args.backend == "openai" else None,
         "chandra_repetition_retry_step": args.repetition_retry_step if args.backend == "chandra-vllm" else None,
         "chandra_repetition_penalty_cap": args.repetition_penalty_cap if args.backend == "chandra-vllm" else None,
         "chandra_frequency_penalty": args.frequency_penalty if args.backend == "chandra-vllm" else None,
@@ -780,7 +875,13 @@ def run(args):
         } if args.backend == "chandra-vllm" and not args.disable_repetition_detection else None),
         "chandra_repetition_detection_requested": (not args.disable_repetition_detection
                                                      if args.backend == "chandra-vllm" else None),
+        "qwen_repetition_detection": ({
+            "max_pattern_size": args.repetition_max_pattern_size,
+            "min_pattern_size": args.repetition_min_pattern_size,
+            "min_count": args.repetition_min_count,
+        } if args.backend == "openai" and not args.disable_repetition_detection else None),
         "chandra_loop_policy": "penalty, n-gram early stop, bounded retries, OCR fallback; score final output" if args.backend == "chandra-vllm" else None,
+        "qwen_loop_policy": "vLLM n-gram early stop and bounded retry; score final output" if args.backend == "openai" else None,
         "allow_thinking": args.allow_thinking if args.backend == "openai" else None,
         "prompt": PROMPT if args.backend == "openai" else "chandra SDK built-in prompt",
         "timing": "batch wall time; seconds per page and sample are amortized throughput times",
@@ -901,6 +1002,9 @@ def run(args):
                             "image": state["image"],
                             "error": error,
                             "tokens": pred.get("tokens") if pred and not pred.get("_error") else None,
+                            "completion_tokens": pred.get("completion_tokens") if pred and not pred.get("_error") else None,
+                            "prompt_tokens": pred.get("prompt_tokens") if pred and not pred.get("_error") else None,
+                            "total_tokens": pred.get("total_tokens") if pred and not pred.get("_error") else None,
                             "finish_reason": pred.get("finish_reason") if pred and not pred.get("_error") else None,
                             "loop_detected": bool(pred.get("loop_detected")) if pred and not pred.get("_error") else False,
                             "initial_loop_detected": bool(pred.get("initial_loop_detected")) if pred and not pred.get("_error") else False,
@@ -921,6 +1025,14 @@ def run(args):
                     outcome["tokens"] = sum(
                         int(r["tokens"]) for r in page_records if isinstance(r.get("tokens"), (int, float))
                     )
+                    for token_field in ("completion_tokens", "prompt_tokens", "total_tokens"):
+                        token_values = [r.get(token_field) for r in page_records
+                                        if isinstance(r.get(token_field), (int, float))]
+                        if token_values:
+                            outcome[token_field] = sum(int(value) for value in token_values)
+                    finish_reasons = [r.get("finish_reason") for r in page_records]
+                    if finish_reasons:
+                        outcome["finish_reason"] = finish_reasons[0] if len(finish_reasons) == 1 else finish_reasons
                     outcome["token_limit_reached"] = any(r.get("token_limit_reached") for r in page_records)
                     outcome["loop_detected"] = any(r.get("loop_detected") for r in page_records)
                     outcome["initial_loop_detected"] = any(
@@ -1064,6 +1176,11 @@ def compare(args):
                                  "source_class": r.get("source_class"),
                                  "image_variant": r.get("image_variant"),
                                  "input_image_count": r.get("input_image_count", 1),
+                                 "finish_reason": r.get("finish_reason"),
+                                 "tokens": r.get("tokens"),
+                                 "completion_tokens": r.get("completion_tokens"),
+                                 "prompt_tokens": r.get("prompt_tokens"),
+                                 "total_tokens": r.get("total_tokens"),
                                  "loop_detected": r.get("loop_detected", False),
                                  "initial_loop_detected": r.get("initial_loop_detected", False),
                                  "loop_recovered": r.get("loop_recovered", False),
@@ -1081,6 +1198,8 @@ def compare(args):
             writer = csv.DictWriter(f, fieldnames=["task_id", "run", "image", "cer", "wer", "seconds",
                                                    "status", "source_dataset", "source_split", "source_class",
                                                    "image_variant", "input_image_count",
+                                                   "finish_reason", "tokens", "completion_tokens",
+                                                   "prompt_tokens", "total_tokens",
                                                    "loop_detected", "initial_loop_detected",
                                                    "loop_recovered", "repeat_retries_used",
                                                    "repetition_penalty_used", "initial_repetition_penalty_used",
@@ -1112,6 +1231,8 @@ def parser_factory():
                    help="Chandra vLLM retries for transient request failures")
     p.add_argument("--chandra-repeat-retries", type=int,
                    help="Chandra retries when it detects repeated output")
+    p.add_argument("--qwen-repeat-retries", type=int,
+                   help="Qwen retries when it detects repetition or hits the token ceiling")
     p.add_argument("--repetition-penalty", type=float,
                    help="vLLM token repetition penalty for Chandra")
     p.add_argument("--repetition-retry-step", type=float,

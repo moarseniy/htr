@@ -117,7 +117,7 @@ python fullpage_ocr_benchmark.py compare \
   --csv runs/school-notebooks-val-comparison.csv
 ```
 
-After selecting a configuration on validation, use the corresponding `*-test.json` configs for the held-out test split.
+After selecting a configuration on validation, use the corresponding `*-test.json` configs for the held-out test split. The raw Qwen test run hit its token ceiling on task `school-notebooks-test-57`; `configs/qwen-school-test-guarded.json` enables vLLM repetition detection and one bounded retry for a follow-up run. Its final output, including any output that still reaches the ceiling, remains scored.
 
 ## HWR200
 
