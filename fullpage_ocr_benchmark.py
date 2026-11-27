@@ -1108,8 +1108,19 @@ def run(args):
                             flags.append("loop-remains")
                         if outcome.get("token_limit_reached"):
                             flags.append("token-limit")
-                        if outcome.get("repetition_penalty_used") is not None:
-                            flags.append(f"penalty={outcome['repetition_penalty_used']:.2f}")
+                        used_penalty = outcome.get("repetition_penalty_used")
+                        if isinstance(used_penalty, (int, float)):
+                            flags.append(f"penalty={used_penalty:.2f}")
+                        elif isinstance(used_penalty, (list, tuple)):
+                            numeric_penalties = sorted({
+                                float(value) for value in used_penalty
+                                if isinstance(value, (int, float))
+                            })
+                            if len(numeric_penalties) == 1:
+                                flags.append(f"penalty={numeric_penalties[0]:.2f}")
+                            elif numeric_penalties:
+                                formatted = ",".join(f"{value:.2f}" for value in numeric_penalties)
+                                flags.append(f"penalties={formatted}")
                         print(f"  task={outcome['task_id']} CER={outcome['cer']:.2%} "
                               f"WER={outcome['wer']:.2%} "
                               f"{' '.join(flags)}", flush=True)

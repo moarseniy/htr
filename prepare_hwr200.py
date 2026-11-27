@@ -53,11 +53,11 @@ def document_key(source: str, annotation_path: Path, root: Path) -> str:
 
 
 def build_document_splits(root: Path, seed: int = 42):
-    """Assign linked HWR200 documents to stable 80/10/10 splits.
+    """Assign HWR200 source folders to stable 80/10/10 splits.
 
-    Reuse documents that cite the same original are kept together. Documents
-    with identical normalized full_text are grouped as well. The assignment is
-    computed from all source classes, so it stays identical across modalities.
+    Folder IDs are grouped across source classes and modalities. Transitive
+    reuse-reference groups are intentionally not used: they can connect most
+    of the corpus and leave validation with only one source class.
     """
     records = []
     for source in SOURCES:
@@ -66,74 +66,18 @@ def build_document_splits(root: Path, seed: int = 42):
             gt = data.get("full_text")
             if not isinstance(gt, str) or not normalized(gt):
                 continue
-            refs = []
-            if source == "Reuse":
-                refs = [
-                    value["id"]
-                    for name, value in data.items()
-                    if name.startswith("reuse_") and isinstance(value, dict)
-                    and isinstance(value.get("id"), str) and value["id"].strip()
-                ]
             records.append({
                 "key": document_key(source, annotation_path, root),
                 "source": source,
-                "annotation_path": annotation_path,
-                "text": normalized(gt).casefold(),
-                "reuse_refs": refs,
+                "source_id": annotation_path.parent.name,
             })
 
     if not records:
         raise ValueError("No non-empty HWR200 full_text annotations found for splitting")
 
-    parent = {record["key"]: record["key"] for record in records}
-
-    def find(key):
-        parent.setdefault(key, key)
-        root_key = key
-        while parent[root_key] != root_key:
-            root_key = parent[root_key]
-        while parent[key] != key:
-            next_key = parent[key]
-            parent[key] = root_key
-            key = next_key
-        return root_key
-
-    def union(left, right):
-        left_root, right_root = find(left), find(right)
-        if left_root != right_root:
-            low, high = sorted((left_root, right_root))
-            parent[high] = low
-
-    originals_by_name = defaultdict(list)
-    for record in records:
-        if record["source"] == "Originals":
-            path = record["annotation_path"]
-            originals_by_name[path.name.casefold()].append(record["key"])
-            originals_by_name[path.stem.casefold()].append(record["key"])
-
-    for record in records:
-        key = record["key"]
-        text_hash = hashlib.sha256(record["text"].encode("utf-8")).hexdigest()
-        union(key, f"text:{text_hash}")
-
-        for reference in record["reuse_refs"]:
-            ref_path = Path(reference)
-            aliases = {ref_path.name.casefold(), ref_path.stem.casefold()}
-            matches = sorted({
-                original_key
-                for alias in aliases
-                for original_key in originals_by_name.get(alias, [])
-            })
-            if matches:
-                for original_key in matches:
-                    union(key, original_key)
-            else:
-                # Preserve links even if the referenced original is absent.
-                union(key, f"missing-original:{ref_path.name.casefold()}")
-
     groups = defaultdict(list)
     for record in records:
-        groups[find(record["key"])].append(record)
+        groups[record["source_id"]].append(record)
     if len(groups) < 3:
         raise ValueError(
             f"Cannot create train/val/test splits from only {len(groups)} independent document groups"
@@ -177,7 +121,7 @@ def build_document_splits(root: Path, seed: int = 42):
 
     stats = {
         "documents": len(records),
-        "groups": len(groups),
+        "source_id_groups": len(groups),
         "split_documents": dict(split_doc_counts),
         "split_classes": {split: dict(counts) for split, counts in split_class_counts.items()},
     }
@@ -270,7 +214,7 @@ def convert(root: Path, modality_key: str, output: Path, source_filter: str = "a
     if not rows:
         raise ValueError(f"No annotated HWR200 documents found for modality {modality!r}")
     if split_manifests:
-        print(f"Split seed: {split_seed}; grouping: linked reuse/original docs and identical full_text")
+        print(f"Split seed: {split_seed}; grouping: source folder ID across annotation classes")
         print(f"Annotation split totals: {json.dumps(split_stats, ensure_ascii=False, sort_keys=True)}")
         for split in SPLIT_RATIOS:
             split_rows = [row for row in rows if row["split"] == split]
