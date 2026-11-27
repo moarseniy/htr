@@ -84,40 +84,50 @@ def build_document_splits(root: Path, seed: int = 42):
         )
 
     rng = random.Random(seed)
-    grouped_records = list(groups.values())
-    rng.shuffle(grouped_records)
-    grouped_records.sort(key=len, reverse=True)
+    profile_groups = defaultdict(list)
+    for group in groups.values():
+        profile = tuple(sorted(Counter(record["source"] for record in group).items()))
+        profile_groups[profile].append(group)
 
-    target_total = {name: len(records) * ratio for name, ratio in SPLIT_RATIOS.items()}
-    class_totals = Counter(record["source"] for record in records)
-    target_class = {
-        split: {source: class_totals[source] * ratio for source in SOURCES}
-        for split, ratio in SPLIT_RATIOS.items()
-    }
     split_doc_counts = Counter()
     split_class_counts = {split: Counter() for split in SPLIT_RATIOS}
     assignment = {}
     split_names = list(SPLIT_RATIOS)
 
-    for group in grouped_records:
-        group_classes = Counter(record["source"] for record in group)
+    # Split groups with the same class profile in the requested proportions.
+    # This prevents groups containing rare classes from being swallowed by
+    # the much larger Reuse population during a corpus-wide greedy assignment.
+    for profile in sorted(profile_groups):
+        profile_items = profile_groups[profile]
+        rng.shuffle(profile_items)
+        n_groups = len(profile_items)
+        quotas = {split: int(n_groups * ratio) for split, ratio in SPLIT_RATIOS.items()}
+        remainders = {split: n_groups * ratio - quotas[split]
+                      for split, ratio in SPLIT_RATIOS.items()}
+        remaining = n_groups - sum(quotas.values())
+        while remaining:
+            best_remainder = max(remainders.values())
+            candidates = [split for split in split_names
+                          if abs(remainders[split] - best_remainder) < 1e-12]
+            if len(candidates) > 1:
+                # Break equal fractional remainders toward the split that is
+                # currently smaller by document count, then use the fixed seed.
+                smallest = min(split_doc_counts[split] for split in candidates)
+                candidates = [split for split in candidates if split_doc_counts[split] == smallest]
+            selected = rng.choice(candidates)
+            quotas[selected] += 1
+            remainders[selected] = -1.0
+            remaining -= 1
 
-        def projected_load(split):
-            overall = (split_doc_counts[split] + len(group)) / target_total[split]
-            class_loads = [
-                (split_class_counts[split][source] + group_classes[source]) / target_class[split][source]
-                for source in SOURCES if target_class[split][source] > 0
-            ]
-            return 0.5 * overall + 0.5 * (sum(class_loads) / len(class_loads))
-
-        scores = {split: projected_load(split) for split in split_names}
-        best = min(scores.values())
-        candidates = [split for split in split_names if abs(scores[split] - best) < 1e-12]
-        selected = rng.choice(candidates)
-        split_doc_counts[selected] += len(group)
-        split_class_counts[selected].update(group_classes)
-        for record in group:
-            assignment[record["key"]] = selected
+        cursor = 0
+        for split in split_names:
+            for group in profile_items[cursor:cursor + quotas[split]]:
+                group_classes = Counter(record["source"] for record in group)
+                split_doc_counts[split] += len(group)
+                split_class_counts[split].update(group_classes)
+                for record in group:
+                    assignment[record["key"]] = split
+            cursor += quotas[split]
 
     stats = {
         "documents": len(records),
