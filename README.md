@@ -121,36 +121,36 @@ After selecting a configuration on validation, use the corresponding `*-test.jso
 
 ## HWR200
 
-HWR200 JSON annotations contain a transcript for the whole document, while each `hw_dataset/<id>/<item>/...` folder contains its pages. `prepare_hwr200.py` therefore creates document-level manifest rows with an ordered list of page images. It creates one manifest per acquisition mode so scans, light photos, and dark photos are scored separately instead of counting the same text three times.
+HWR200 JSON annotations contain a transcript for the whole document, while each `hw_dataset/<id>/<item>/...` folder contains its pages. `prepare_hwr200.py` therefore creates document-level manifest rows with an ordered list of page images. It creates separate manifests for scans, light photos, and dark photos instead of counting the same text three times. For model development, create train/val/test manifests by document group. Reuse documents linked to an original annotation stay in the same split; exact duplicate `full_text` values are grouped too. The same split assignment is used across all three image modalities.
 
 The HWR200 folder currently available on this machine is only a fragment: it has 300 annotation/image pairs per modality (20 FPR, 20 Originals, 260 Reuse) and 1,091 page images. Its manifests are named `hwr200_subset_*.jsonl`; do not use those for full-dataset results. The converter requires an explicit root path to avoid silently using this fragment.
 
 ```bash
 python prepare_hwr200.py --root /absolute/path/to/full/HWR200 --modality scans \
-  --output data/open_manifests/hwr200_full_scans.jsonl
+  --split-manifests --output data/open_manifests/hwr200_scans.jsonl
 python prepare_hwr200.py --root /absolute/path/to/full/HWR200 --modality light \
-  --output data/open_manifests/hwr200_full_light.jsonl
+  --split-manifests --output data/open_manifests/hwr200_light.jsonl
 python prepare_hwr200.py --root /absolute/path/to/full/HWR200 --modality dark \
-  --output data/open_manifests/hwr200_full_dark.jsonl
+  --split-manifests --output data/open_manifests/hwr200_dark.jsonl
 ```
 
-Example: run both models on the scans modality. The runner OCRs each document's pages in filename order, joins their outputs, and scores against that document's `full_text`.
+Each command writes `_train.jsonl`, `_val.jsonl`, and `_test.jsonl` beside the requested output name. The split is deterministic with seed 42. First compare models on `val`; reserve `test` for a final run after choosing the model and decoding settings. The runner OCRs each document's pages in filename order, joins their outputs, and scores against that document's `full_text`.
 
 ```bash
-HTR_MANIFEST="$PWD/data/open_manifests/hwr200_full_scans.jsonl" \
-HTR_OUTPUT="$PWD/runs/hwr200-scans-chandra" \
+HTR_MANIFEST="$PWD/data/open_manifests/hwr200_scans_val.jsonl" \
+HTR_OUTPUT="$PWD/runs/hwr200-scans-val-chandra" \
 python fullpage_ocr_benchmark.py run --config configs/chandra-hwr.json
 
-HTR_MANIFEST="$PWD/data/open_manifests/hwr200_full_scans.jsonl" \
-HTR_OUTPUT="$PWD/runs/hwr200-scans-qwen" \
-python fullpage_ocr_benchmark.py run --config configs/qwen-hwr.json
+HTR_MANIFEST="$PWD/data/open_manifests/hwr200_scans_val.jsonl" \
+HTR_OUTPUT="$PWD/runs/hwr200-scans-val-qwen-guarded" \
+python fullpage_ocr_benchmark.py run --config configs/qwen-hwr-guarded.json
 
 python fullpage_ocr_benchmark.py compare \
-  runs/hwr200-scans-chandra runs/hwr200-scans-qwen \
-  --csv runs/hwr200-scans-comparison.csv
+  runs/hwr200-scans-val-chandra runs/hwr200-scans-val-qwen-guarded \
+  --csv runs/hwr200-scans-val-comparison.csv
 ```
 
-Repeat with `hwr200_full_light.jsonl` and `hwr200_full_dark.jsonl` to compare the photo conditions. The repository currently contains `hwr200_subset_*.jsonl` only for pipeline smoke checks.
+Repeat with `hwr200_light_val.jsonl` and `hwr200_dark_val.jsonl` if you need modality-specific comparisons. When model and decoding settings are frozen, run the chosen setup once on the matching `_test.jsonl`. Use only `_train.jsonl` for training. The repository currently contains `hwr200_subset_*.jsonl` only for pipeline smoke checks.
 
 ## Compare runs
 
