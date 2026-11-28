@@ -165,3 +165,42 @@ Runs must use the same manifest hash. The comparison uses exactly the pages with
 ```bash
 pip install -r requirements.txt
 ```
+
+## First Qwen HTR LoRA pilot
+
+This pilot trains a LoRA adapter on the official School Notebooks `train` split. It starts with this single-page set so the training image and full-page transcript match the current inference unit. HWR200 remains in validation only for this pilot: its transcript is document-level across multiple pages, while the current benchmark sends each page separately. Add HWR200 to training after the Qwen path uses the same multi-image document format for training and evaluation.
+
+The base checkpoint for training must be the BF16 `Qwen3.5-27B` directory. The existing FP8 copy is used for inference. Keep training dependencies in a separate environment so they do not change the vLLM environment.
+
+Copy these files from the development workspace to `~/proj/htr-main` on the workstation: `prepare_qwen_sft.py`, `requirements-train.txt`, `scripts/train_qwen27b_htr_lora.sh`, `scripts/export_qwen27b_htr_lora.sh`, and `configs/qwen-htr-train.env.example`.
+
+```bash
+cd ~/proj/htr-main
+conda create -n htr-train python=3.12 -y
+conda activate htr-train
+python -m pip install -r requirements-train.txt
+
+python prepare_school_notebooks.py \
+  --root /home/mokin-a/proj/data/HTR/school_notebooks_RU \
+  --split train \
+  --output data/open_manifests/school_notebooks_train.jsonl
+
+python prepare_qwen_sft.py \
+  --manifest data/open_manifests/school_notebooks_train.jsonl \
+  --output data/training/school_notebooks_train_sft.jsonl
+
+cp configs/qwen-htr-train.env.example configs/qwen-htr-train.env
+# Edit QWEN_TRAIN_MODEL_DIR to the local BF16 Qwen3.5-27B directory.
+nvidia-smi
+bash scripts/train_qwen27b_htr_lora.sh
+```
+
+The SFT converter rejects rows outside the `train` split and verifies every image path. The pilot runs one epoch with LoRA, BF16, two GPUs, batch size 1 per GPU, gradient accumulation 8, gradient checkpointing, and FSDP2. It writes the adapter under `QWEN_HRT_OUTPUT_DIR` and creates a `last` checkpoint link.
+
+After training, export a merged copy for the existing benchmark:
+
+```bash
+bash scripts/export_qwen27b_htr_lora.sh
+```
+
+Serve the merged directory shown by the script on port 8001 with alias `Qwen/Qwen3.5-27B-HTR`. Then evaluate on the unchanged School validation and HWR v3 validation manifests with `configs/qwen-hwr-guarded.json`, setting `--model Qwen/Qwen3.5-27B-HTR` and a new output folder for each run. Keep both test splits unused until the training settings are frozen.

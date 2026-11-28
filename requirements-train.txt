@@ -1,0 +1,10 @@
+# Separate training environment. PyTorch wheels are available locally.
+--find-links /home/mokin-a/wheels/
+torch==2.14.1
+torchvision==0.29.2
+transformers==5.20.2
+accelerate==1.15.0
+Pillow==12.3.0
+flash-linear-attention==0.5.2
+qwen-vl-utils>=0.0.14
+ms-swift==4.6.1
